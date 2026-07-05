@@ -1,0 +1,7 @@
+{
+  "_comment": "ComfyUI reverse-proxy + coexistence settings (see handle_comfyui_proxy in llama_priority_proxy.py). Delete this file to disable the feature entirely -- routes under /comfyui then return 503. base_url must be reachable from this proxy's own container (ComfyUI's compose service needs its port published to the host, e.g. '127.0.0.1:8188:8188', since it isn't by default). coexist_scenario names the scenario (see config/scenario_comfy_coexist.json) activated the moment a generation starts.",
+  "base_url": "http://127.0.0.1:8188",
+  "coexist_scenario": "comfy_coexist",
+  "queue_poll_interval_s": 2,
+  "revert_delay_s": 5
+}

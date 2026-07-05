@@ -13,9 +13,6 @@ venv/
 # Model files — huge, environment-specific, never committed
 *.gguf
 
-# Environment-specific config (auto-generated or per-deployment)
-config/
-
 # Secrets and API keys
 .env
 proxy_api_key.secret

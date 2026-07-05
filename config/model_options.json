@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "Per-model options for `bench`, keyed by filename without .gguf.",
+    "Auto-populated by `inspect --write-options`; re-running it only ADDS newly",
+    "discovered models (or backfills label/keep_alive if missing) — it never",
+    "touches/overwrites values you've already edited here.",
+    "",
+    "Fields (all optional except parallel):",
+    "  parallel     (default 1)   how many concurrent slots to benchmark this model with.",
+    "                             This is the one you'll most likely change: bump it to",
+    "                             match how many parallel requests you actually intend to",
+    "                             serve — it shifts the measured VRAM baseline and can't",
+    "                             be corrected after the fact by `solve`.",
+    "  min_ctx      (optional)    override the small ctx sample point used for the fit.",
+    "  max_ctx      (optional)    override the detected native context ceiling; also used",
+    "                             as the large sample point when min_ctx is set.",
+    "  extra_args   (optional)    extra llama-server flags (auto-set to [\"--embedding\"]",
+    "                             for detected embedding models).",
+    "  n_gpu_layers (default 99)  GPU offload layer count.",
+    "  label        (default: the model's own name) friendly nickname the future",
+    "                             priority proxy will expose instead of this raw",
+    "                             filename-derived name. Purely cosmetic/routing —",
+    "                             does not affect benchmarking or trigger a re-bench.",
+    "  keep_alive   (default: blank) how long to keep this model loaded when idle",
+    "                             before eviction, Ollama-style: a duration string",
+    "                             (\"5m\", \"10s\", \"66h\") or \"-1\" for never evict.",
+    "                             NOT wired up yet — reserved for the proxy; changing",
+    "                             it does not affect benchmarking or trigger a re-bench.",
+    "",
+    "Sampling defaults (all optional, all passed straight through as llama-server",
+    "CLI flags at spawn — see spawn_model()/sampling_args() in llama_priority_proxy.py):",
+    "  temp, top_k, top_p, min_p, repeat_penalty, repeat_last_n,",
+    "  presence_penalty, frequency_penalty",
+    "These only set the server-side DEFAULT — a client that sends its own",
+    "temperature/top_p/etc. in the request body still overrides them per-request.",
+    "Meaningless for embedding models (no token sampling happens); omit for those.",
+    "llama-server's own built-in defaults (temp=0.8, top_k=40, top_p=0.95, min_p=0.05,",
+    "repeat_penalty=1.0 i.e. DISABLED, no presence/frequency penalty) are why an",
+    "unconfigured model can fall into a repeat loop — nothing discourages it."
+  ],
+  "options": {
+    "Qwen3.6-35B-A3B-UD-Q4_K_XL": {
+      "parallel": 4,
+      "label": "TakacsAI",
+      "keep_alive": "-1",
+      "extra_args": [
+        "--mmproj",
+        "/models/mmproj-F16.gguf"
+      ],
+      "_sampling_comment": "qwen35moe (Qwen3-family) general chat defaults per Qwen's own generation guidance; presence_penalty is Qwen's documented fix for quantized-model repeat loops.",
+      "temp": 0.7,
+      "top_k": 20,
+      "top_p": 0.8,
+      "min_p": 0,
+      "repeat_penalty": 1.05,
+      "presence_penalty": 1.0
+    },
+    "nomic-embed-text": {
+      "parallel": 1,
+      "label": "nomic-embed-text",
+      "keep_alive": "",
+      "extra_args": [
+        "--embedding"
+      ]
+    },
+    "ornith-35b": {
+      "parallel": 4,
+      "label": "TakacsAI-Coder",
+      "keep_alive": "20m",
+      "_sampling_comment": "Same qwen35moe arch as the chat model, but tuned tighter for coding correctness: lower temp, same anti-repeat-loop presence_penalty.",
+      "temp": 0.3,
+      "top_k": 20,
+      "top_p": 0.8,
+      "min_p": 0,
+      "repeat_penalty": 1.05,
+      "presence_penalty": 1.0
+    },
+    "qwen2.5-coder-1.5b": {
+      "parallel": 1,
+      "label": "qwen2.5-coder-1.5b",
+      "keep_alive": "",
+      "_sampling_comment": "FIM/autocomplete model — kept near-deterministic (low temp) but WITHOUT repeat/presence penalty: code legitimately repeats tokens (braces, indentation, identifiers) and penalizing that degrades completions.",
+      "temp": 0.2,
+      "top_k": 20,
+      "top_p": 0.95
+    }
+  }
+}

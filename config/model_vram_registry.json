@@ -1,0 +1,109 @@
+{
+  "models": [
+    {
+      "name": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "parallel_tested": 4,
+      "max_ctx": 262144,
+      "base_vram_bytes": 24396169216,
+      "bytes_per_ctx_token": 21504.0,
+      "config_signature": {
+        "parallel": 4,
+        "max_ctx": 262144,
+        "min_ctx": null,
+        "n_gpu_layers": 99,
+        "extra_args": [
+          "--mmproj",
+          "/models/mmproj-F16.gguf"
+        ]
+      },
+      "samples": [
+        {
+          "ctx": 4096,
+          "vram_bytes": 24484249600
+        },
+        {
+          "ctx": 262144,
+          "vram_bytes": 30033313792
+        }
+      ],
+      "measured_at": "2026-07-05T00:55:49"
+    },
+    {
+      "name": "nomic-embed-text",
+      "parallel_tested": 1,
+      "max_ctx": 2048,
+      "base_vram_bytes": 838860800,
+      "bytes_per_ctx_token": 0.0,
+      "config_signature": {
+        "parallel": 1,
+        "max_ctx": 2048,
+        "min_ctx": null,
+        "n_gpu_layers": 99,
+        "extra_args": [
+          "--embedding"
+        ]
+      },
+      "samples": [
+        {
+          "ctx": 1024,
+          "vram_bytes": 838860800
+        },
+        {
+          "ctx": 2048,
+          "vram_bytes": 838860800
+        }
+      ],
+      "measured_at": "2026-07-04T15:56:35"
+    },
+    {
+      "name": "ornith-35b",
+      "parallel_tested": 4,
+      "max_ctx": 262144,
+      "base_vram_bytes": 21801992192,
+      "bytes_per_ctx_token": 21504.0,
+      "config_signature": {
+        "parallel": 4,
+        "max_ctx": 262144,
+        "min_ctx": null,
+        "n_gpu_layers": 99,
+        "extra_args": []
+      },
+      "samples": [
+        {
+          "ctx": 4096,
+          "vram_bytes": 21890072576
+        },
+        {
+          "ctx": 262144,
+          "vram_bytes": 27439136768
+        }
+      ],
+      "measured_at": "2026-07-04T17:03:09"
+    },
+    {
+      "name": "qwen2.5-coder-1.5b",
+      "parallel_tested": 1,
+      "max_ctx": 32768,
+      "base_vram_bytes": 1635778560,
+      "bytes_per_ctx_token": 29696.0,
+      "config_signature": {
+        "parallel": 1,
+        "max_ctx": 32768,
+        "min_ctx": null,
+        "n_gpu_layers": 99,
+        "extra_args": []
+      },
+      "samples": [
+        {
+          "ctx": 4096,
+          "vram_bytes": 1757413376
+        },
+        {
+          "ctx": 32768,
+          "vram_bytes": 2608857088
+        }
+      ],
+      "measured_at": "2026-07-04T15:58:27"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "_comment": "Scenario 'coding': active while working in VSCode. Ornith (main coding, primary slot) auto-fills remaining VRAM; autocomplete gets a small fixed context on the secondary slot. nomic-embed-text is NOT a member here anymore -- it's an always-on standalone model outside the scenario system, see config/standalone_models.json.",
+  "name": "coding",
+  "priority": 90,
+  "default": false,
+  "port": 11446,
+  "port_secondary": 11447,
+  "models": [
+    {"name": "ornith-35b", "ctx": "auto", "slot": "primary", "fallback_for": ["chat", "coding"]},
+    {"name": "qwen2.5-coder-1.5b", "ctx": 8192, "slot": "secondary", "label": "coding-autocomplete", "fallback_for": []}
+  ]
+}

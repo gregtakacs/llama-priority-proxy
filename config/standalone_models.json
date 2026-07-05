@@ -1,0 +1,6 @@
+{
+  "_comment": "Always-on models outside the scenario/priority system entirely -- loaded once at proxy startup, never evicted, no priority contest with scenarios. Small enough (nomic-embed-text ~800MB) that reserving them permanently is cheap.",
+  "models": [
+    {"name": "nomic-embed-text", "ctx": 8192, "port": 11445}
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "Scenario 'chat': the default/idle baseline the proxy reverts to. Single MoE chat model via Open WebUI, parallel=4, shared (--kv-unified) context. Also directly usable with `benchmark_vram.py solve --scenario config/scenario_chat.json` (extra fields below are proxy-only and ignored by solve).",
+  "name": "chat",
+  "priority": 50,
+  "default": true,
+  "port": 11446,
+  "models": [
+    {"name": "Qwen3.6-35B-A3B-UD-Q4_K_XL", "ctx": "auto", "slot": "primary", "fallback_for": ["chat"]}
+  ]
+}
