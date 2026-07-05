@@ -1,0 +1,11 @@
+{
+  "_comment": "Example standalone models — copy to config/standalone_models.json. These models are always loaded and never evicted, outside the scenario system.",
+  "models": [
+    {
+      "_comment": "Embedding model — always resident, separate port on 127.0.0.1",
+      "name": "nomic-embed-text",
+      "port": 11445,
+      "ctx": 8192
+    }
+  ]
+}

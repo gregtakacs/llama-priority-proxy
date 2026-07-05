@@ -1,0 +1,95 @@
+# =============================================================================
+# Multi-stage llama.cpp build — targets NVIDIA Blackwell (sm_120 / RTX 5090)
+# =============================================================================
+# Stage 1: Build from source with CUDA support
+# Stage 2: Slim runtime image with only the compiled binary and shared libs
+# ---------------------------------------------------------------------------
+# Stage 1: Builder
+# ---------------------------------------------------------------------------
+# Pinned by digest, not just tag — nvidia/cuda:12.8.1-devel-ubuntu22.04 is a
+# mutable tag that NVIDIA republishes; without the digest a rebuild can pull a
+# new image and invalidate every layer after FROM, forcing a full CUDA
+# recompile even though LLAMA_CPP_COMMIT below never changed.
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97 AS builder
+
+ARG CMAKE_CUDA_ARCHITECTURES="120a"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git libcurl4-openssl-dev curl wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build/llama.cpp
+
+# Clone a pinned commit of llama.cpp — b9871
+ARG LLAMA_CPP_COMMIT=ef2d770117db45b05aa7ecd1b0acca36370c5470
+RUN git clone https://github.com/ggml-org/llama.cpp.git . && \
+    git checkout ${LLAMA_CPP_COMMIT}
+
+# Configure and build
+# -DCMAKE_LIBRARY_PATH points at the CUDA driver stub (no real driver present
+# during a `docker build`) and -Wl,--allow-shlib-undefined lets the linker
+# defer resolution of driver-API symbols (cuMemCreate, etc.) to container
+# runtime, when nvidia-container-toolkit injects the real libcuda.so.1.
+RUN mkdir -p build && cd build && \
+    cmake .. \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}" \
+        -DLLAMA_CURL=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DGGML_CUDA_FORCE_CUBLAS=OFF \
+        -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" && \
+    cmake --build . --config Release -j$(nproc)
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04@sha256:4a801ef9232d2b05e69df4eb8aa054dbbe2824e5499e1e6e857320bb01ac41a9 AS runtime
+
+LABEL org.opencontainers.image.source="https://github.com/ggml-org/llama.cpp"
+LABEL org.opencontainers.image.description="llama.cpp server with CUDA support for RTX 5090 (Blackwell)"
+
+# libgomp1 is required at runtime (OpenMP, used by the CPU backend) —
+# missing this causes: "error while loading shared libraries: libgomp.so.1"
+# python3 (not python3-minimal) + python3-pip run llama_priority_proxy.py —
+# stdlib alone isn't enough once aiohttp is a dependency (Debian's -minimal
+# package deliberately omits stdlib modules like json/urllib too).
+RUN mkdir -p /models && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        curl libcurl4 libgomp1 ca-certificates python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the compiled binary and shared libraries from the builder stage
+COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=builder /build/llama.cpp/build/bin/*.so* /usr/local/lib/
+
+ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
+
+WORKDIR /app
+COPY requirements.txt .
+# No --break-system-packages: that flag requires pip 23+ (PEP 668), which
+# doesn't exist yet on Ubuntu 22.04's stock python3-pip -- passing it is a
+# hard "no such option" error here, not a harmless no-op.
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# llama_priority_proxy.py is the entrypoint now — it spawns/evicts
+# llama-server child processes itself based on config/ (see that directory's
+# own files), replacing what entrypoint.sh used to hardcode for one model.
+# config/ and the models directory are intentionally NOT copied in here —
+# both get bind-mounted at `docker run` time so they can be edited/rebenched
+# without a rebuild, same convention as ollama-priority-proxy's config file.
+COPY llama_process.py llama_priority_proxy.py ./
+
+ENV MODELS_DIR=/models
+ENV CONFIG_DIR=/app/config
+ENV PROXY_PORT=11444
+ENV GPU_INDEX=0
+
+EXPOSE 11444
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
+  CMD curl -f http://localhost:${PROXY_PORT}/health || exit 1
+
+ENTRYPOINT ["python3", "/app/llama_priority_proxy.py"]

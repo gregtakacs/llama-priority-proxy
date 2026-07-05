@@ -1,0 +1,25 @@
+{
+  "_comment": "Example scenario — copy and rename to config/scenario_<name>.json. Adjust model names to match those in model_options.json.",
+  "name": "chat",
+  "priority": 1,
+  "default": true,
+  "port": 11446,
+  "port_secondary": 11447,
+  "models": [
+    {
+      "_comment": "Primary model — auto-sized to fill remaining VRAM after fixed ctx members",
+      "name": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "ctx": "auto",
+      "slot": "primary",
+      "label": "TakacsAI",
+      "fallback_for": ["coding"]
+    },
+    {
+      "_comment": "Secondary model — same ctx as primary, loaded in parallel",
+      "name": "ornith-35b",
+      "ctx": "auto",
+      "slot": "secondary",
+      "label": "TakacsAI-Code"
+    }
+  ]
+}

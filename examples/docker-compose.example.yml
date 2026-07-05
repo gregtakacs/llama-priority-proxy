@@ -1,0 +1,39 @@
+#############################################################################
+# llama-priority-proxy — Docker Compose example
+#
+# Based on a NAS-STACK setup (Traefik, Docker secrets, NVIDIA runtime).
+# Adapt paths, secrets, and environment variables for your deployment.
+#
+# Key notes:
+#   - `build` context points to this repo — adjust if you clone it elsewhere
+#   - `runtime: nvidia` required for CUDA GPU access
+#   - `network_mode: host` avoids port mapping conflicts (scenarios use
+#     multiple ports internally, all bound to 127.0.0.1)
+#   - API key is read from a Docker secret file (see secrets section)
+#   - config/ is bind-mounted :ro — create and edit it on the host
+#############################################################################
+
+services:
+  llama-cpp:
+    container_name: llama-cpp
+    build:
+      context: .
+      dockerfile: Dockerfile.llama-cpp-priority-proxy
+    runtime: nvidia
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PROXY_API_KEY_FILE=/run/secrets/proxy_api_key
+    volumes:
+      # Path to your GGUF model files (read-only inside container)
+      - /path/to/your/models:/models:ro
+      # Path to your config directory (read-only, create on host first)
+      - /path/to/your/config:/app/config:ro
+    secrets:
+      - source: ollama_token
+        target: /run/secrets/proxy_api_key
+
+secrets:
+  ollama_token:
+    file: ./proxy_api_key.secret
