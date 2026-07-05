@@ -1228,23 +1228,27 @@ async function fetchSlots(port) {
       const data = await resp.json();
       const slots = Array.isArray(data) ? data : (data.slots || []);
       const total = slots.length;
-      const running = slots.filter(s => s.is_processing).length;
-      updateProcIndicators(port, running, total);
+      const active = new Array(total).fill(false);
+      slots.forEach((s, i) => {
+        const idx = (typeof s.id === 'number') ? s.id : i;
+        if (idx >= 0 && idx < total) active[idx] = !!s.is_processing;
+      });
+      updateProcIndicators(port, active, total);
     } else {
-      updateProcIndicators(port, 0, 0);
+      updateProcIndicators(port, [], 0);
     }
   } catch(e) {
-    updateProcIndicators(port, 0, 0);
+    updateProcIndicators(port, [], 0);
   }
 }
 
-function updateProcIndicators(port, running, total) {
+function updateProcIndicators(port, active, total) {
   const procCell = document.querySelector(`.proc-cell[data-port="${port}"]`);
   if (!procCell) return;
   const slots = total || 1;
+  const running = active.filter(Boolean).length;
   const dots = Array.from({length: slots}, (_, i) => {
-    const active = i < running;
-    return `<div class="proc-dot${active ? ' active' : ''}"></div>`;
+    return `<div class="proc-dot${active[i] ? ' active' : ''}"></div>`;
   }).join('');
   procCell.innerHTML = `<div class="proc-indicators">${dots}<span class="proc-label">${running}/${slots}</span></div>`;
 }
