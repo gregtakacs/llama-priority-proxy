@@ -92,4 +92,4 @@ EXPOSE 11444
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
   CMD curl -f http://localhost:${PROXY_PORT}/health || exit 1
 
-ENTRYPOINT ["python3", "/app/llama_priority_proxy.py"]
+ENTRYPOINT ["python3", "-u", "/app/llama_priority_proxy.py"]

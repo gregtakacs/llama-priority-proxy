@@ -102,11 +102,17 @@ def openai_error(status, message, err_type="invalid_request_error", code=None):
 
 @web.middleware
 async def auth_middleware(request, handler):
-    # /health is deliberately exempt: Docker's HEALTHCHECK can't authenticate,
-    # and liveness alone doesn't leak anything /status would (model/scenario
-    # state stays behind the key like every other route).
+    # /health and /dashboard (the static HTML/JS shell only — no data) are
+    # exempt: Docker's HEALTHCHECK can't authenticate, and the dashboard page
+    # itself has nothing to hide — it can't see anything until its own JS
+    # supplies this same Bearer key to /status and /slots/*, which ARE
+    # protected below like every other route.
+    # Exact-match only, NEVER startswith: "/" as a startswith-prefix matches
+    # every path (everything starts with "/"), which previously exempted the
+    # entire API — see the incident this comment is here to prevent recurring.
     api_key = request.app["proxy_api_key"]
-    if api_key and request.path != "/health":
+    exempt_paths = {"/health", "/dashboard", "/dashboard/", "/"}
+    if api_key and request.path not in exempt_paths:
         auth = request.headers.get("Authorization", "")
         if auth != f"Bearer {api_key}":
             return openai_error(401, "Incorrect API key provided.", code="invalid_api_key")
@@ -303,6 +309,7 @@ async def activate_scenario(state, scenario_name, load_timeout_s):
     for name, lm in list(state.loaded.items()):
         if name in new_names and lm.ctx_size == new_sizes.get(name):
             continue  # shared with the new scenario at the same size — keep it running
+        print(f"[proxy] activate_scenario('{scenario_name}'): evicting '{name}' (not in new scenario, or ctx-size mismatch)")
         await evict_model(lm)
         del state.loaded[name]
 
@@ -333,16 +340,27 @@ async def eager_load_pinned_members(state, scenario_name, load_timeout_s):
             print(f"[proxy] WARNING: failed to eager-load pinned model '{m['name']}': {e}")
 
 
-def find_fallback(state, scenario_name):
+def model_supports_vision(state, name):
+    return "--mmproj" in state.options.get(name, {}).get("extra_args", [])
+
+
+def find_fallback(state, scenario_name, require_vision=False):
     """A resident model in the currently ACTIVE scenario tagged to cover
     `scenario_name`'s role — used to serve a same-or-lower-priority request
     from what's already loaded instead of thrashing. None if nothing resident
-    qualifies (caller falls back to a real switch in that case)."""
+    qualifies (caller falls back to a real switch in that case).
+
+    require_vision excludes a candidate that lacks --mmproj: fallback aliasing
+    is invisible to the client (see forward()'s docstring), so silently
+    routing an image request to a text-only alias would just crash inside
+    llama-server instead of failing loudly — better to force a real switch to
+    a model that can actually see the image."""
     if state.active_scenario is None:
         return None
     active_def = state.scenarios[state.active_scenario]
     candidates = [m for m in active_def["models"]
-                  if scenario_name in m.get("fallback_for", []) and m["name"] in state.loaded]
+                  if scenario_name in m.get("fallback_for", []) and m["name"] in state.loaded
+                  and (not require_vision or model_supports_vision(state, m["name"]))]
     if not candidates:
         return None
     candidates.sort(key=lambda m: 0 if m.get("slot") == "primary" else 1)
@@ -456,10 +474,18 @@ async def forward(request, state, body, port, client_label, real_name, max_wait_
             return response
         return web.json_response(err_body, status=503)
 
-    async with state.http_session.post(url, json=body) as resp:
+    # aiohttp.ClientSession()'s default total timeout is 300s — long enough to
+    # feel "safe" in testing, short enough that a legitimately large/slow
+    # generation under concurrent load can exceed it. That used to look
+    # identical to a dead backend (both raise a ClientConnectionError
+    # subclass) and would evict a perfectly healthy, still-generating model.
+    # Bounded generously here instead of left at the session default so real
+    # crashes are still caught without punishing slow-but-alive requests.
+    forward_timeout = aiohttp.ClientTimeout(total=1800)
+    async with state.http_session.post(url, json=body, timeout=forward_timeout) as resp:
         if not is_stream:
             data = await resp.json()
-            if isinstance(data, dict) and data.get("model") == real_name:
+            if isinstance(data, dict) and "model" in data:
                 data["model"] = client_label
             return web.json_response(data, status=resp.status)
 
@@ -470,7 +496,7 @@ async def forward(request, state, body, port, client_label, real_name, max_wait_
                 if payload and payload != "[DONE]":
                     try:
                         obj = json.loads(payload)
-                        if obj.get("model") == real_name:
+                        if "model" in obj:
                             obj["model"] = client_label
                         line = f"data: {json.dumps(obj)}\n"
                     except json.JSONDecodeError:
@@ -484,6 +510,23 @@ async def forward(request, state, body, port, client_label, real_name, max_wait_
 # HTTP handlers
 # ---------------------------------------------------------------------------
 
+_IMAGE_CONTENT_TYPES = {"image_url", "input_image", "image"}
+
+
+def request_has_image(body):
+    """True if any message's content includes an image part (OpenAI multimodal
+    chat format) — checked so an image request can be kept off a model/alias
+    that was never launched with --mmproj, instead of reaching llama-server
+    and failing there with an opaque backend error."""
+    for message in body.get("messages", []):
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _IMAGE_CONTENT_TYPES:
+                    return True
+    return False
+
+
 async def handle_completion(request):
     state = request.app["state"]
     try:
@@ -496,12 +539,45 @@ async def handle_completion(request):
     if target is None:
         return openai_error(404, f"Unknown model '{requested_label}'.", code="model_not_found")
 
+    has_image = request_has_image(body)
+    if has_image and not model_supports_vision(state, target["name"]):
+        return openai_error(400, f"Model '{requested_label}' does not accept image input "
+                                  f"(no vision projector configured for it).", code="unsupported_content")
+
     if target["scenario"] is None:
         lm = state.standalone_loaded.get(target["name"])
         if lm is None:
             return openai_error(503, f"Standalone model '{target['name']}' is not loaded.")
-        lm.last_used = time.monotonic()
-        return await forward(request, state, body, lm.port, requested_label, target["name"], state.max_wait_s)
+        try:
+            result = await forward(request, state, body, lm.port, requested_label, target["name"], state.max_wait_s)
+            lm.last_used = time.monotonic()  # set on completion, not dispatch — see forward()'s call sites
+            return result
+        except asyncio.CancelledError:
+            print(f"[proxy] request for '{target['name']}' (standalone) cancelled (client disconnected?) — not evicting")
+            raise
+        except aiohttp.ClientConnectorError as e:
+            # A genuine failure to even establish a NEW connection — the
+            # child is actually down. Popping the dict alone would just
+            # forget it while it keeps running and holding VRAM forever;
+            # evict_model actually tells it to shut down (a safe no-op if
+            # it's already dead — shutdown_server checks poll() first).
+            print(f"[proxy] '{target['name']}' (standalone) evicted after {type(e).__name__}: {e}")
+            async with state.spawn_lock:
+                stale = state.standalone_loaded.pop(target["name"], None)
+                if stale is not None:
+                    await evict_model(stale)
+            return openai_error(503, f"Model '{requested_label}' is not responding (it may have crashed).",
+                                 code="model_unavailable")
+        except aiohttp.ClientConnectionError as e:
+            # Broader than ClientConnectorError — also covers a reset/closed
+            # transport mid-request, which is exactly what happens when the
+            # INCOMING client (e.g. an IDE autocomplete cancelling on every
+            # keystroke) drops its own request: that tears down our outbound
+            # write to the backend without the backend being unhealthy at
+            # all. Don't evict a perfectly good model over someone else's
+            # cancel — see the "loaded then unloaded" incident this guards.
+            print(f"[proxy] '{target['name']}' (standalone) request failed after {type(e).__name__}: {e} (not evicting)")
+            return openai_error(503, f"Request to '{requested_label}' failed: {e}", code="request_failed")
 
     scenario_name = target["scenario"]
     async with state.spawn_lock:
@@ -510,11 +586,35 @@ async def handle_completion(request):
                                 if state.active_scenario else -1)
             outranks_active = state.scenarios[scenario_name]["priority"] > active_priority
             if not outranks_active:
-                alias = find_fallback(state, scenario_name)
+                alias = find_fallback(state, scenario_name, require_vision=has_image)
                 if alias is not None:
-                    alias.last_used = time.monotonic()
-                    return await forward(request, state, body, alias.port, requested_label, alias.name, state.max_wait_s)
-                # Nothing resident can cover it — no cheaper option than switching.
+                    try:
+                        result = await forward(request, state, body, alias.port, requested_label, alias.name, state.max_wait_s)
+                        alias.last_used = time.monotonic()
+                        return result
+                    except asyncio.CancelledError:
+                        print(f"[proxy] request for '{alias.name}' (fallback alias) cancelled (client disconnected?) — not evicting")
+                        raise
+                    except aiohttp.ClientConnectorError as e:
+                        print(f"[proxy] '{alias.name}' (fallback alias) evicted after {type(e).__name__}: {e}")
+                        # Already holding spawn_lock here — mutate directly, don't re-acquire.
+                        # See the standalone-path comment: must actually evict
+                        # (kill), not just forget, or a still-alive process
+                        # orphans and its VRAM is never reclaimed.
+                        stale = state.loaded.pop(alias.name, None)
+                        if stale is not None:
+                            await evict_model(stale)
+                        return openai_error(503, f"Model '{requested_label}' is not responding (it may have crashed).",
+                                             code="model_unavailable")
+                    except aiohttp.ClientConnectionError as e:
+                        # See the standalone-path comment — a reset/closed
+                        # transport mid-request is very often just the
+                        # incoming client cancelling, not a dead backend.
+                        print(f"[proxy] '{alias.name}' (fallback alias) request failed after {type(e).__name__}: {e} (not evicting)")
+                        return openai_error(503, f"Request to '{requested_label}' failed: {e}", code="request_failed")
+                # Nothing resident can cover it (or, for an image request, nothing
+                # resident that both covers it and can actually see) — no cheaper
+                # option than switching.
             await activate_scenario(state, scenario_name, state.load_timeout_s)
 
         lm = state.loaded.get(target["name"])
@@ -522,14 +622,44 @@ async def handle_completion(request):
             scenario = state.scenarios[scenario_name]
             port = scenario["port"] if target["slot"] == "primary" else scenario["port_secondary"]
             ctx = state.reserved_ctx[target["name"]]
+            print(f"[proxy] on-demand spawning '{target['name']}' on port {port} (ctx={ctx:,}) for request to '{requested_label}'")
             try:
                 lm = await spawn_model(state, target["name"], port, ctx, state.load_timeout_s)
             except RuntimeError as e:
                 return openai_error(503, str(e))
             state.loaded[target["name"]] = lm
 
-    lm.last_used = time.monotonic()
-    return await forward(request, state, body, lm.port, requested_label, target["name"], state.max_wait_s)
+    try:
+        result = await forward(request, state, body, lm.port, requested_label, target["name"], state.max_wait_s)
+        lm.last_used = time.monotonic()  # on completion, not dispatch — "idle" should mean actually idle
+        return result
+    except asyncio.CancelledError:
+        print(f"[proxy] request for '{target['name']}' cancelled (client disconnected?) — not evicting")
+        raise
+    except aiohttp.ClientConnectorError as e:
+        # A genuine failure to even establish a NEW connection — the child
+        # actually died (e.g. a CUDA OOM abort under concurrent load) and
+        # left state.loaded stale, so every future request would hit the
+        # same dead port forever. evict_model actually shuts it down (a
+        # safe no-op if already dead) instead of just forgetting it.
+        print(f"[proxy] '{target['name']}' evicted after {type(e).__name__}: {e}")
+        async with state.spawn_lock:
+            stale = state.loaded.pop(target["name"], None)
+            if stale is not None:
+                await evict_model(stale)
+        return openai_error(503, f"Model '{requested_label}' is not responding (it may have crashed) — "
+                                  f"it will reload on the next request.", code="model_unavailable")
+    except aiohttp.ClientConnectionError as e:
+        # Broader than ClientConnectorError — also covers a reset/closed
+        # transport mid-request. That's exactly what happens when the
+        # INCOMING client (e.g. Continue's autocomplete, which cancels and
+        # resends on every keystroke) drops its own request: it tears down
+        # our outbound write to the backend without the backend being
+        # unhealthy at all. Treating this as a crash was the actual cause of
+        # the "model loads then immediately unloads" incident — the model
+        # got killed once per keystroke for no real reason. Don't evict.
+        print(f"[proxy] '{target['name']}' request failed after {type(e).__name__}: {e} (not evicting)")
+        return openai_error(503, f"Request to '{requested_label}' failed: {e}", code="request_failed")
 
 
 async def handle_status(request):
@@ -559,6 +689,653 @@ async def handle_status(request):
             for s in state.scenarios.values()
         ],
     })
+
+
+async def handle_activate_scenario(request):
+    """POST /scenarios/{name}/activate — manual override from the dashboard.
+    Unlike a normal request, this ignores priority entirely: the operator
+    explicitly asked for this scenario, so it switches regardless of whether
+    it would "outrank" whatever's currently active. That's only a one-time
+    nudge, not a pin — the very next incoming request still routes by the
+    usual priority/fallback rules, so a higher-priority scenario reclaims
+    its spot the moment it's actually needed again."""
+    state = request.app["state"]
+    name = request.match_info["name"]
+    if name not in state.scenarios:
+        return openai_error(404, f"Unknown scenario '{name}'.", code="scenario_not_found")
+    async with state.spawn_lock:
+        if state.active_scenario != name:
+            try:
+                await activate_scenario(state, name, state.load_timeout_s)
+            except RuntimeError as e:
+                return openai_error(503, str(e))
+    return web.json_response({"active_scenario": state.active_scenario})
+
+
+async def handle_slots_port(request):
+    """GET /slots/{port} — proxy to the child llama-server process.
+    This is served by the proxy itself (same-origin), avoiding the
+    cross-origin CORS issues of hitting child servers directly from the
+    browser. Behind the same Bearer-key check as every other data route."""
+    state = request.app["state"]
+    port = request.match_info["port"]
+    try:
+        async with state.http_session.get(f"http://127.0.0.1:{port}/slots",
+                                           timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            data = await resp.json()
+            return web.json_response(data, status=resp.status)
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+        return web.json_response([], status=200)  # empty slots if child unreachable
+
+
+async def handle_dashboard(request):
+    """Serve the embedded dashboard HTML — no auth required."""
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+
+# ---------------------------------------------------------------------------
+# Dashboard HTML (embedded — served at /dashboard, no auth needed)
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Llama Priority Proxy — Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #222633;
+    --border: #2e3345;
+    --text: #e1e4ed;
+    --text-dim: #8b8fa3;
+    --accent: #6c8cff;
+    --accent-dim: #3a4a8c;
+    --green: #4ade80;
+    --yellow: #facc15;
+    --red: #f87171;
+    --orange: #fb923c;
+    --radius: 10px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    min-height: 100vh;
+  }
+  h1 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    margin-bottom: 20px;
+    letter-spacing: -0.02em;
+  }
+  h1 span { color: var(--accent); }
+  .grid { display: grid; gap: 16px; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: 2fr 1fr 1fr; }
+  @media (max-width: 900px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+  }
+  .card-title {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+    font-weight: 600;
+  }
+  .settings-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .settings-row input { flex: 1; min-width: 200px; }
+  input, select, button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 0.875rem;
+    outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  input::placeholder { color: var(--text-dim); }
+  button {
+    cursor: pointer;
+    font-weight: 500;
+    transition: all 0.15s;
+    border: 1px solid var(--border);
+  }
+  button:hover { border-color: var(--accent); }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn-primary:hover { background: #5a7ae8; }
+  .btn-sm { padding: 4px 10px; font-size: 0.78rem; }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 20px;
+    font-size: 0.8rem; font-weight: 600;
+  }
+  .status-ok { background: rgba(74,222,128,0.12); color: var(--green); }
+  .status-err { background: rgba(248,113,113,0.12); color: var(--red); }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .scenario-name { font-size: 1.6rem; font-weight: 700; color: var(--accent); }
+  .scenario-meta { color: var(--text-dim); font-size: 0.82rem; margin-top: 4px; }
+  .gpu-bar-wrap { height: 14px; background: var(--bg); border-radius: 7px; overflow: hidden; margin-top: 8px; }
+  .gpu-bar { height: 100%; border-radius: 7px; transition: width 0.6s ease; background: linear-gradient(90deg, var(--green), var(--yellow)); }
+  .gpu-text { margin-top: 6px; font-size: 0.85rem; color: var(--text-dim); }
+  .gpu-text strong { color: var(--text); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th { text-align: left; padding: 8px 10px; color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .model-name { font-weight: 600; }
+  .model-name small { display: block; color: var(--text-dim); font-weight: 400; font-size: 0.75rem; }
+  .proc-indicators { display: inline-flex; gap: 3px; align-items: center; }
+  .proc-dot { width: 10px; height: 10px; border-radius: 3px; background: var(--border); transition: background 0.2s; }
+  .proc-dot.active { background: var(--accent); }
+  .proc-label { margin-left: 4px; font-size: 0.75rem; color: var(--text-dim); }
+  .scenario-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; border-radius: 6px;
+    margin-bottom: 6px; font-size: 0.85rem;
+  }
+  .scenario-item.active { background: rgba(108,140,255,0.1); border: 1px solid var(--accent-dim); }
+  .scenario-item:not(.active) { border: 1px solid var(--border); }
+  .scenario-item .name { font-weight: 600; flex: 1; }
+  .scenario-item .priority { color: var(--text-dim); font-size: 0.78rem; }
+  .scenario-item .default-badge {
+    background: rgba(74,222,128,0.12); color: var(--green);
+    font-size: 0.68rem; padding: 2px 7px; border-radius: 10px; font-weight: 600;
+  }
+  .empty { color: var(--text-dim); font-size: 0.85rem; padding: 8px 0; }
+  .refresh-info { font-size: 0.75rem; color: var(--text-dim); }
+  .hidden { display: none; }
+  .error-msg { color: var(--red); font-size: 0.82rem; margin-top: 8px; }
+  .scenario-item[data-scenario] { cursor: pointer; }
+  .scenario-item[data-scenario]:hover { border-color: var(--accent); }
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: flex; align-items: center; justify-content: center; z-index: 100;
+  }
+  .modal-overlay.hidden { display: none; }
+  .modal-card { max-width: 380px; width: 90%; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+</style>
+</head>
+<body>
+
+<h1>🐫 <span>Llama</span> Priority Proxy</h1>
+
+<div id="loginGate" class="card" style="max-width:360px;margin:64px auto;text-align:center;">
+  <div class="card-title">Enter Proxy API Key</div>
+  <div class="settings-row" style="justify-content:center;">
+    <input type="password" id="apiKeyInput" placeholder="API key" autocomplete="current-password" style="max-width:220px;">
+    <button class="btn-primary" id="apiKeySubmit">Unlock</button>
+  </div>
+  <div class="error-msg hidden" id="loginError"></div>
+</div>
+
+<div id="dashboardApp" style="display:none;">
+
+<div class="card" style="margin-bottom: 16px;">
+  <div class="settings-row">
+    <select id="refreshRate">
+      <option value="1">1s</option>
+      <option value="2">2s</option>
+      <option value="3" selected>3s</option>
+      <option value="5">5s</option>
+      <option value="10">10s</option>
+      <option value="30">30s</option>
+    </select>
+    <span class="refresh-info" id="refreshInfo">Refresh: auto</span>
+    <button class="btn-sm" id="logoutBtn" style="margin-left:auto;">Log out</button>
+  </div>
+  <div class="error-msg hidden" id="errorMsg"></div>
+</div>
+
+<div class="grid grid-2" id="mainContent" style="display:none;">
+
+  <div style="display:flex;flex-direction:column;gap:16px;">
+    <div class="card">
+      <div class="card-title">Active Scenario</div>
+      <div class="scenario-name" id="activeScenario">—</div>
+      <div class="scenario-meta" id="scenarioMeta"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Loaded Models</div>
+      <div id="modelsTable"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">All Scenarios</div>
+      <div id="scenariosList"></div>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:16px;">
+    <div class="card">
+      <div class="card-title">Status</div>
+      <div id="statusBadge"></div>
+      <div class="scenario-meta" id="lastUpdate"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">GPU VRAM</div>
+      <div class="gpu-text"><strong id="gpuUsed">—</strong> used of <strong id="gpuTotal">—</strong></div>
+      <div class="gpu-bar-wrap"><div class="gpu-bar" id="gpuBar"></div></div>
+      <div class="gpu-text" id="gpuFree" style="margin-top:4px;"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Standalone Models</div>
+      <div id="standaloneModels"></div>
+    </div>
+  </div>
+</div>
+
+<div id="emptyState" class="card" style="text-align:center;padding:48px 24px;display:none;">
+  <div style="color:var(--text-dim);font-size:0.95rem;">Unable to connect to proxy.</div>
+</div>
+
+<div id="switchModal" class="modal-overlay hidden">
+  <div class="card modal-card">
+    <div class="card-title">Confirm Scenario Switch</div>
+    <div style="margin:12px 0;font-size:0.9rem;">
+      Switch active scenario to <strong id="switchModalName"></strong>?
+      This evicts the currently loaded model(s) and may take up to a minute
+      while the new scenario's models load.
+    </div>
+    <div class="error-msg hidden" id="switchModalError"></div>
+    <div class="modal-actions">
+      <button id="switchModalCancel">Cancel</button>
+      <button class="btn-primary" id="switchModalConfirm">Switch</button>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+// ---- Auth (Bearer key stored for this browser tab session only — cleared
+// on tab/window close, never persisted to localStorage/disk) ----
+const AUTH_STORAGE_KEY = 'llamaProxyApiKey';
+
+function getStoredKey() { return sessionStorage.getItem(AUTH_STORAGE_KEY) || ''; }
+function setStoredKey(k) { sessionStorage.setItem(AUTH_STORAGE_KEY, k); }
+function clearStoredKey() { sessionStorage.removeItem(AUTH_STORAGE_KEY); }
+
+function authHeaders() {
+  const key = getStoredKey();
+  return key ? { 'Authorization': `Bearer ${key}` } : {};
+}
+
+function showLogin(message) {
+  stopPolling();
+  document.getElementById('loginGate').classList.remove('hidden');
+  document.getElementById('dashboardApp').style.display = 'none';
+  const el = document.getElementById('loginError');
+  if (message) {
+    el.textContent = message;
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+}
+
+function showApp() {
+  document.getElementById('loginGate').classList.add('hidden');
+  document.getElementById('dashboardApp').style.display = '';
+}
+
+async function trySubmitKey(key) {
+  setStoredKey(key);
+  try {
+    await apiFetch('/status');  // throws + clears key + re-shows login on 401
+    showApp();
+    startPolling();
+  } catch (e) {
+    if (getStoredKey()) {  // still set => not the 401 path, which already re-prompted
+      showLogin(e.message);
+    }
+  }
+}
+
+document.getElementById('apiKeySubmit').addEventListener('click', () => {
+  const val = document.getElementById('apiKeyInput').value.trim();
+  if (val) trySubmitKey(val);
+});
+document.getElementById('apiKeyInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('apiKeySubmit').click();
+});
+document.getElementById('logoutBtn').addEventListener('click', () => {
+  clearStoredKey();
+  showLogin();
+  document.getElementById('apiKeyInput').value = '';
+});
+
+// ---- API (relative paths — same origin; Authorization header carries the
+// session key set up by the login gate above) ----
+async function apiFetch(path) {
+  const resp = await fetch(path, { headers: authHeaders() });
+  if (resp.status === 401) {
+    clearStoredKey();
+    showLogin('Invalid or expired API key.');
+    throw new Error('Unauthorized');
+  }
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => '');
+    throw new Error(`HTTP ${resp.status}: ${errBody || resp.statusText}`);
+  }
+  return resp.json();
+}
+
+// ---- Polling ----
+let pollTimer = null;
+
+async function fetchAndRender() {
+  try {
+    const status = await apiFetch('/status');
+    showStatusOk('Connected');
+    hideError();
+    // Show main content on first success
+    document.getElementById('mainContent').style.display = '';
+    document.getElementById('emptyState').style.display = 'none';
+    renderStatus(status);
+  } catch(e) {
+    showStatusErr('Disconnected');
+    showError(e.message);
+  }
+  document.getElementById('refreshInfo').textContent = `Refresh: ${getRefreshRateSeconds()}s`;
+}
+
+function startPolling() {
+  fetchAndRender();
+  pollTimer = setInterval(fetchAndRender, getRefreshRate());
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+function getRefreshRate() {
+  return parseInt(document.getElementById('refreshRate').value) * 1000;
+}
+
+function getRefreshRateSeconds() {
+  return document.getElementById('refreshRate').value;
+}
+
+document.getElementById('refreshRate').addEventListener('change', () => {
+  stopPolling();
+  startPolling();
+});
+
+// ---- Render ----
+function formatBytes(b) {
+  if (b == null) return 'N/A';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = parseFloat(b);
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(2)} ${units[i]}`;
+}
+
+function fmtNum(n) { return n.toLocaleString(); }
+
+function fmtIdle(secs) {
+  if (secs < 1) return 'just now';
+  if (secs < 60) return `${Math.round(secs)}s`;
+  if (secs < 3600) return `${(secs/60).toFixed(0)}m`;
+  return `${(secs/3600).toFixed(1)}h`;
+}
+
+function parseByteStr(s) {
+  if (!s) return 0;
+  const m = s.match(/([\d.]+)\s*(B|KB|MB|GB|TB)/i);
+  if (!m) return 0;
+  const v = parseFloat(m[1]);
+  const u = m[2].toUpperCase();
+  const mult = {B:1, KB:1024, MB:1024*1024, GB:1024*1024*1024, TB:1024*1024*1024*1024}[u] || 1;
+  return v * mult;
+}
+
+function showStatusOk(msg) {
+  document.getElementById('statusBadge').innerHTML =
+    `<span class="status-badge status-ok"><span class="status-dot"></span>${msg}</span>`;
+}
+function showStatusErr(msg) {
+  document.getElementById('statusBadge').innerHTML =
+    `<span class="status-badge status-err"><span class="status-dot"></span>${msg}</span>`;
+}
+function showError(msg) {
+  const el = document.getElementById('errorMsg');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+function hideError() {
+  document.getElementById('errorMsg').classList.add('hidden');
+}
+
+function renderStatus(data) {
+  document.getElementById('activeScenario').textContent = data.active_scenario || 'None';
+  const activeScenarioDef = data.scenarios?.find(s => s.active);
+  const activeModels = data.loaded_models || [];
+  const activeModelNames = activeModels.map(m => m.name);
+  let metaParts = [];
+  if (activeScenarioDef) {
+    metaParts.push(`Priority: ${activeScenarioDef.priority}`);
+    if (activeScenarioDef.default) metaParts.push('Default');
+  }
+  metaParts.push(`${activeModelNames.length} model${activeModelNames.length !== 1 ? 's' : ''} in scenario`);
+  document.getElementById('scenarioMeta').textContent = metaParts.join(' · ');
+
+  document.getElementById('lastUpdate').textContent = `Last update: ${new Date().toLocaleTimeString()}`;
+
+  if (data.gpu) {
+    document.getElementById('gpuTotal').textContent = data.gpu.total;
+    document.getElementById('gpuUsed').textContent = data.gpu.used;
+    if (data.gpu.free) document.getElementById('gpuFree').textContent = `Free: ${data.gpu.free}`;
+    else document.getElementById('gpuFree').textContent = '';
+    const totalBytes = parseByteStr(data.gpu.total);
+    const usedBytes = parseByteStr(data.gpu.used);
+    const pct = totalBytes > 0 ? Math.min(100, (usedBytes / totalBytes) * 100) : 0;
+    const bar = document.getElementById('gpuBar');
+    bar.style.width = pct + '%';
+    if (pct > 80) bar.style.background = 'linear-gradient(90deg, #f87171, #fb923c)';
+    else if (pct > 50) bar.style.background = 'linear-gradient(90deg, #facc15, #fb923c)';
+    else bar.style.background = 'linear-gradient(90deg, #4ade80, #facc15)';
+  }
+
+  renderModelsTable(data.loaded_models || [], 'modelsTable', 'modelSlotCache');
+  renderModelsTable(data.standalone_models || [], 'standaloneModels', 'standaloneSlotCache');
+  renderScenariosList(data.scenarios || []);
+}
+
+function renderModelsTable(models, containerId, cacheKey) {
+  const container = document.getElementById(containerId);
+  if (models.length === 0) {
+    container.innerHTML = '<div class="empty">No models loaded</div>';
+    return;
+  }
+
+  // Build or update table rows — only rebuild if model set changed
+  const slotCache = window[cacheKey] = window[cacheKey] || {};
+
+  // Check if we need to rebuild (model set changed)
+  const currentModels = new Set();
+  container.querySelectorAll('tr[data-model]').forEach(tr => {
+    currentModels.add(tr.getAttribute('data-model'));
+  });
+  const newModels = new Set(models.map(m => `${m.name}|${m.port}`));
+  const needRebuild = currentModels.size !== newModels.size ||
+                      ![...newModels].every(k => currentModels.has(k)) ||
+                      ![...currentModels].every(k => newModels.has(k));
+
+  if (needRebuild) {
+    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Context</th><th>Processes</th><th>Idle</th></tr></thead><tbody>`;
+    for (const m of models) {
+      const slotInfo = slotCache[m.port] || { slots: 0, running: 0, loaded: false };
+      const numDots = slotInfo.slots || 1;
+      const indicators = Array.from({length: numDots}, (_, i) => {
+        const active = i < slotInfo.running;
+        return `<div class="proc-dot${active ? ' active' : ''}"></div>`;
+      }).join('');
+      const procLabel = slotInfo.loaded ? `${slotInfo.running}/${slotInfo.slots}` : 'loading...';
+      html += `<tr data-model="${m.name}|${m.port}">
+        <td class="model-name">${m.name}<small>ctx ${fmtNum(m.ctx_size)}</small></td>
+        <td>${m.port}</td>
+        <td>${fmtNum(m.ctx_size)}</td>
+        <td class="proc-cell" data-port="${m.port}"><div class="proc-indicators">${indicators}<span class="proc-label">${procLabel}</span></div></td>
+        <td class="idle-cell">${m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—'}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } else {
+    // Update existing rows without rebuilding
+    for (const m of models) {
+      const row = container.querySelector(`tr[data-model="${m.name}|${m.port}"]`);
+      if (row) {
+        const idleCell = row.querySelector('.idle-cell');
+        if (idleCell) idleCell.textContent = m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—';
+      }
+    }
+  }
+
+  // Update process indicators from slot polling
+  for (const m of models) {
+    fetchSlots(m.port);
+  }
+}
+
+async function fetchSlots(port) {
+  try {
+    const resp = await fetch(`/slots/${port}`, { headers: authHeaders() });
+    if (resp.ok) {
+      const data = await resp.json();
+      const slots = Array.isArray(data) ? data : (data.slots || []);
+      const total = slots.length;
+      const running = slots.filter(s => s.is_processing).length;
+      updateProcIndicators(port, running, total);
+    } else {
+      updateProcIndicators(port, 0, 0);
+    }
+  } catch(e) {
+    updateProcIndicators(port, 0, 0);
+  }
+}
+
+function updateProcIndicators(port, running, total) {
+  const procCell = document.querySelector(`.proc-cell[data-port="${port}"]`);
+  if (!procCell) return;
+  const slots = total || 1;
+  const dots = Array.from({length: slots}, (_, i) => {
+    const active = i < running;
+    return `<div class="proc-dot${active ? ' active' : ''}"></div>`;
+  }).join('');
+  procCell.innerHTML = `<div class="proc-indicators">${dots}<span class="proc-label">${running}/${slots}</span></div>`;
+}
+
+function renderScenariosList(scenarios) {
+  const container = document.getElementById('scenariosList');
+  if (scenarios.length === 0) {
+    container.innerHTML = '<div class="empty">No scenarios</div>';
+    return;
+  }
+  let html = '';
+  for (const s of scenarios) {
+    const cls = s.active ? 'active' : '';
+    const defaultBadge = s.default ? '<span class="default-badge">default</span>' : '';
+    const clickAttr = s.active ? '' : ` data-scenario="${s.name}"`;
+    html += `<div class="scenario-item ${cls}"${clickAttr}>
+      ${s.active ? '<span style="color:var(--accent);font-size:0.8rem;">●</span>' : '<span style="color:var(--text-dim);font-size:0.8rem;">○</span>'}
+      <span class="name">${s.name} ${defaultBadge}</span>
+      <span class="priority">#${s.priority}</span>
+    </div>`;
+  }
+  container.innerHTML = html;
+}
+
+// ---- Scenario switching (manual override, confirmed via modal) ----
+let pendingScenario = null;
+
+function openSwitchModal(name) {
+  pendingScenario = name;
+  document.getElementById('switchModalName').textContent = name;
+  document.getElementById('switchModalError').classList.add('hidden');
+  const btn = document.getElementById('switchModalConfirm');
+  btn.disabled = false;
+  btn.textContent = 'Switch';
+  document.getElementById('switchModal').classList.remove('hidden');
+}
+
+function closeSwitchModal() {
+  document.getElementById('switchModal').classList.add('hidden');
+  pendingScenario = null;
+}
+
+document.getElementById('scenariosList').addEventListener('click', (e) => {
+  const item = e.target.closest('.scenario-item[data-scenario]');
+  if (!item) return;
+  openSwitchModal(item.getAttribute('data-scenario'));
+});
+
+document.getElementById('switchModalCancel').addEventListener('click', closeSwitchModal);
+
+document.getElementById('switchModalConfirm').addEventListener('click', async () => {
+  if (!pendingScenario) return;
+  const btn = document.getElementById('switchModalConfirm');
+  const errEl = document.getElementById('switchModalError');
+  btn.disabled = true;
+  btn.textContent = 'Switching… (can take up to a minute)';
+  errEl.classList.add('hidden');
+  try {
+    const resp = await fetch(`/scenarios/${encodeURIComponent(pendingScenario)}/activate`,
+                              { method: 'POST', headers: authHeaders() });
+    if (resp.status === 401) {
+      clearStoredKey();
+      closeSwitchModal();
+      showLogin('Invalid or expired API key.');
+      return;
+    }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => null);
+      throw new Error(body?.error?.message || `HTTP ${resp.status}`);
+    }
+    closeSwitchModal();
+    await fetchAndRender();
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = 'Switch';
+  }
+});
+
+// Init
+document.getElementById('refreshInfo').textContent = 'Refresh: auto';
+const storedKey = getStoredKey();
+if (storedKey) {
+  trySubmitKey(storedKey);
+} else {
+  showLogin();
+}
+</script>
+</body>
+</html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +1368,11 @@ async def on_cleanup(app):
 
 
 def build_app(state, proxy_api_key):
-    app = web.Application(middlewares=[auth_middleware])
+    # aiohttp's default client_max_size (1 MiB) is smaller than a single
+    # base64-encoded image in a chat completion request — raised here so
+    # multimodal requests don't get rejected with 413 before handle_completion
+    # ever sees them.
+    app = web.Application(middlewares=[auth_middleware], client_max_size=64 * 1024 * 1024)
     app["state"] = state
     app["proxy_api_key"] = proxy_api_key
     app.router.add_post("/v1/chat/completions", handle_completion)
@@ -599,7 +1380,11 @@ def build_app(state, proxy_api_key):
     app.router.add_post("/v1/embeddings", handle_completion)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/status", handle_status)
+    app.router.add_post("/scenarios/{name}/activate", handle_activate_scenario)
+    app.router.add_get("/slots/{port}", handle_slots_port)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/dashboard", handle_dashboard)
+    app.router.add_get("/", handle_dashboard)  # / → dashboard
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
