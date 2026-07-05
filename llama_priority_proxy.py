@@ -817,6 +817,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     border-radius: var(--radius);
     padding: 18px;
   }
+  /* Grid stretches both grid-2 columns to equal height, but the flex-column
+     stack inside each only takes the height its cards actually need — leaving
+     a gap below the shorter column's last card instead of a flush bottom
+     edge. Growing that last card absorbs the gap so both columns bottom out
+     at the same line. */
+  .card-fill { flex: 1; display: flex; flex-direction: column; }
   .card-title {
     font-size: 0.75rem;
     text-transform: uppercase;
@@ -950,7 +956,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="modelsTable"></div>
     </div>
 
-    <div class="card">
+    <div class="card card-fill">
       <div class="card-title">All Scenarios</div>
       <div id="scenariosList"></div>
     </div>
@@ -970,7 +976,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="gpu-text" id="gpuFree" style="margin-top:4px;"></div>
     </div>
 
-    <div class="card">
+    <div class="card card-fill">
       <div class="card-title">Standalone Models</div>
       <div id="standaloneModels"></div>
     </div>
