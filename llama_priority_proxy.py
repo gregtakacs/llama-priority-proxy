@@ -1327,12 +1327,31 @@ document.getElementById('switchModalConfirm').addEventListener('click', async ()
 
 // Init
 document.getElementById('refreshInfo').textContent = 'Refresh: auto';
-const storedKey = getStoredKey();
-if (storedKey) {
-  trySubmitKey(storedKey);
-} else {
+
+async function init() {
+  const storedKey = getStoredKey();
+  if (storedKey) {
+    await trySubmitKey(storedKey);
+    return;
+  }
+  // No stored key yet — try without one first. If PROXY_API_KEY isn't set
+  // on the proxy at all, auth is off for every route (not just this one),
+  // so an anonymous /status call already succeeds and there's nothing to
+  // log in to. Only fall back to the login gate if that actually fails,
+  // instead of always prompting for a "key" that might not even exist.
+  try {
+    const resp = await fetch('/status');
+    if (resp.ok) {
+      showApp();
+      startPolling();
+      return;
+    }
+  } catch (e) {
+    // network error — fall through to the login gate below
+  }
   showLogin();
 }
+init();
 </script>
 </body>
 </html>"""

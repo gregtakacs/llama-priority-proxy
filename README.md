@@ -11,6 +11,8 @@ An OpenAI-compatible request routing proxy for [llama.cpp](https://github.com/gg
 - **Fallback model aliasing** — Tag a resident model to cover another scenario's role, avoiding unnecessary switches.
 - **Eager-load pinned models** — Mark a model with `keep_alive: -1` to load it immediately when its scenario activates.
 - **OpenAI-compatible API** — Works with any OpenAI-compatible client (Open WebUI, etc.) via `/v1/chat/completions`, `/v1/embeddings`, etc.
+- **Multimodal (vision) support** — Models launched with `--mmproj` accept image input; image requests are kept off resident models/aliases that lack it instead of failing with an opaque backend error.
+- **Live status dashboard** — A built-in web UI at `/dashboard` showing active scenario, loaded models, per-slot activity, and GPU VRAM, with a control to manually switch scenarios.
 - **Bearer token authentication** — Single boundary at the proxy edge; child processes bind to `127.0.0.1` only.
 - **GPU VRAM registry** — Per-model VRAM baselines from benchmarking eliminate guesswork on what fits.
 
@@ -18,11 +20,14 @@ An OpenAI-compatible request routing proxy for [llama.cpp](https://github.com/gg
 
 ```
 Client → :11444 (this proxy)
-             ├── /v1/chat/completions  →  scenario model (e.g. :11446)
-             ├── /v1/embeddings        →  standalone model (e.g. :11445)
-             ├── /v1/models            →  list all available labels
-             ├── /status               →  current state (scenarios, GPU, loaded models)
-             └── /health               →  health check (no auth required)
+             ├── /v1/chat/completions   →  scenario model (e.g. :11446)
+             ├── /v1/embeddings         →  standalone model (e.g. :11445)
+             ├── /v1/models             →  list all available labels
+             ├── /status                →  current state (scenarios, GPU, loaded models)
+             ├── /scenarios/{name}/activate →  manually force a scenario switch
+             ├── /slots/{port}          →  same-origin proxy to a child's /slots (dashboard use)
+             ├── /dashboard, /          →  status dashboard (HTML/JS, no auth — see Authentication)
+             └── /health                →  health check (no auth required)
 ```
 
 The proxy is a Python aiohttp application. It spawns `llama-server` child processes via subprocess, monitors their health, and routes requests to them over HTTP on `127.0.0.1` (they're never exposed externally).
@@ -73,6 +78,23 @@ The `config/` directory contains all routing and model configuration. **Several 
      }
    }
    ```
+
+   **Vision (multimodal) models** — if a model has a matching `mmproj-*.gguf` projector file (check the model's own repo; it ships as a separate file, not bundled into the main GGUF), point `extra_args` at it so `llama-server` loads it alongside the model:
+   ```json
+   {
+     "options": {
+       "Qwen3.6-35B-A3B-UD-Q4_K_XL": {
+         "parallel": 4,
+         "label": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+         "keep_alive": "",
+         "extra_args": ["--mmproj", "/models/mmproj-F16.gguf"]
+       }
+     }
+   }
+   ```
+   The path is the **in-container** path (i.e. relative to wherever your models directory is mounted, typically `/models` — not the host path). Without a model's own `--mmproj` configured, an image-bearing request to it is rejected with a clear 400 rather than forwarded to crash inside `llama-server`; see `model_supports_vision()`/`request_has_image()` in `llama_priority_proxy.py`.
+
+   Note that adding `extra_args` changes the model's VRAM footprint (the vision tower + projector load onto the GPU too), so re-run `bench` afterward — it auto-detects the `config_signature` drift from the changed `extra_args` and re-measures automatically, same as changing `parallel` above.
 
 3. **Benchmark VRAM** to populate `model_vram_registry.json`:
    ```bash
@@ -216,6 +238,9 @@ python llama_priority_proxy.py --models-dir /path/to/models --config-dir config 
 | `/v1/embeddings` | POST | Yes | Embeddings |
 | `/v1/models` | GET | Yes | List available model labels |
 | `/status` | GET | Yes | Current proxy state (GPU, scenarios, loaded models) |
+| `/scenarios/{name}/activate` | POST | Yes | Manually force a scenario switch (bypasses priority — see Dashboard) |
+| `/slots/{port}` | GET | Yes | Same-origin proxy to a child's own `/slots` (used by the dashboard) |
+| `/dashboard`, `/` | GET | No | Status dashboard shell (HTML/JS only — see Authentication) |
 | `/health` | GET | No | Health check (Docker HEALTHCHECK) |
 
 ### Authentication
@@ -225,7 +250,26 @@ Set `PROXY_API_KEY` (or `PROXY_API_KEY_FILE` pointing to a file containing the k
 Authorization: Bearer <your-api-key>
 ```
 
-The `/health` endpoint is always exempt from authentication checks.
+`/health`, `/dashboard`, and `/` are always exempt — but only those three, and only because the dashboard route serves nothing but static HTML/JS with no data in it. Everything the dashboard actually displays (`/status`, `/slots/{port}`) requires the same Bearer key as every other route; the dashboard's own JS prompts for it on first load and holds it in `sessionStorage` (cleared when the tab/browser closes, never written to disk).
+
+> **If `PROXY_API_KEY` is left unset, authentication is not "reduced" — it is off entirely, for every route, not just the dashboard.** `auth_middleware` only enforces the check `if api_key and ...`; an empty/unset key is falsy, so the whole condition short-circuits and every request skips the check, including `/v1/chat/completions` and the scenario-switch endpoint. Running without a key is only safe if the proxy is reachable exclusively from a fully trusted network — remember it binds `0.0.0.0` (and typically `network_mode: host` in the Docker Compose example), so anything else on that network can reach it too.
+
+## Dashboard
+
+A single-page status dashboard is served at `/dashboard` (`/` serves the identical page directly, not a redirect) — no separate build step or static files, the HTML/JS is embedded directly in `llama_priority_proxy.py`.
+
+**What it shows:**
+- Active scenario, its priority, and how many models it has resident
+- Loaded models per scenario (port, context size, idle time) and standalone models
+- Live per-slot activity — one dot per parallel slot, lit up while that slot is actively processing (polled from each child's own `/slots` via the proxy's same-origin `/slots/{port}` route, avoiding CORS issues from hitting child processes directly)
+- GPU VRAM used/free
+- All configured scenarios, with the active one highlighted
+
+**Manual scenario switching:** clicking a non-active scenario opens a confirm modal (it warns that switching evicts the current scenario's models and can take up to a minute to load the new one) and, on confirm, calls `POST /scenarios/{name}/activate`. This is a one-time override, not a pin — normal priority-based routing resumes immediately afterward, so the next request for a higher-priority scenario switches right back.
+
+**Auth flow:** the dashboard page itself loads with no key (see Authentication above), then shows a login gate prompting for the same `PROXY_API_KEY` used everywhere else. The key is kept in `sessionStorage` for that browser tab only — never `localStorage`, never sent anywhere but back to this same proxy as a Bearer header. A wrong key or a `401` mid-session (e.g. the key changed) clears the stored value and re-shows the login gate. There's a logout button that clears it manually.
+
+If `PROXY_API_KEY` is unset, the dashboard's login gate still appears, but any key (or none) will work against `/status`/`/slots` since auth is off entirely in that mode (see the warning above).
 
 ## Project Structure
 
