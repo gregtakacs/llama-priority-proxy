@@ -690,11 +690,19 @@ async def handle_status(request):
     now = time.monotonic()
     gpu_total = gpu_total_bytes(state.gpu_index)
     gpu_used = gpu_used_bytes(state.gpu_index)
+    # Idle-eviction only ever reverts a non-default scenario (see
+    # maybe_evict_idle_scenario) — while the default scenario is active,
+    # nothing gets evicted on idle no matter how long it's been sitting there.
+    active_is_default = (state.active_scenario is not None
+                          and state.scenarios[state.active_scenario].get("default", False))
     return web.json_response({
         "active_scenario": state.active_scenario,
         "loaded_models": [
             {"name": lm.name, "port": lm.port, "ctx_size": lm.ctx_size,
-             "idle_for_s": round(now - lm.last_used, 1)}
+             "idle_for_s": round(now - lm.last_used, 1),
+             "keep_alive": lm.keep_alive,
+             "evict_in_s": (None if active_is_default or parse_keep_alive(lm.keep_alive) is None
+                            else round(max(0.0, parse_keep_alive(lm.keep_alive) - (now - lm.last_used)), 1))}
             for lm in state.loaded.values()
         ],
         "standalone_models": [
@@ -1125,6 +1133,13 @@ function fmtIdle(secs) {
   return `${(secs/3600).toFixed(1)}h`;
 }
 
+function fmtEvict(m) {
+  if (!('keep_alive' in m)) return '—';  // standalone model — never subject to idle eviction
+  if (m.keep_alive === '-1') return 'pinned';
+  if (m.evict_in_s == null) return '—';  // default scenario active — idle eviction doesn't apply right now
+  return m.evict_in_s <= 0 ? 'due' : `in ${fmtIdle(m.evict_in_s)}`;
+}
+
 function parseByteStr(s) {
   if (!s) return 0;
   const m = s.match(/([\d.]+)\s*(B|KB|MB|GB|TB)/i);
@@ -1208,7 +1223,7 @@ function renderModelsTable(models, containerId, cacheKey) {
                       ![...currentModels].every(k => newModels.has(k));
 
   if (needRebuild) {
-    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Context</th><th>Processes</th><th>Idle</th></tr></thead><tbody>`;
+    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Context</th><th>Processes</th><th>Idle</th><th>Evicts</th></tr></thead><tbody>`;
     for (const m of models) {
       const slotInfo = slotCache[m.port] || { slots: 0, running: 0, loaded: false };
       const numDots = slotInfo.slots || 1;
@@ -1223,6 +1238,7 @@ function renderModelsTable(models, containerId, cacheKey) {
         <td>${fmtNum(m.ctx_size)}</td>
         <td class="proc-cell" data-port="${m.port}"><div class="proc-indicators">${indicators}<span class="proc-label">${procLabel}</span></div></td>
         <td class="idle-cell" data-idle-s="${m.idle_for_s != null ? m.idle_for_s : ''}">${m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—'}</td>
+        <td class="evict-cell">${fmtEvict(m)}</td>
       </tr>`;
     }
     html += '</tbody></table>';
@@ -1239,6 +1255,8 @@ function renderModelsTable(models, containerId, cacheKey) {
             idleCell.textContent = m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—';
           }
         }
+        const evictCell = row.querySelector('.evict-cell');
+        if (evictCell) evictCell.textContent = fmtEvict(m);
       }
     }
   }
