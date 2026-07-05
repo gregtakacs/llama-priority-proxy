@@ -172,18 +172,15 @@ def read_gguf_info(path):
 _SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 
 
-def _is_mmproj_info(fname, info):
+def _is_mmproj_info(info):
     """mmproj-*.gguf (vision projector) files are real, readable GGUFs — but a
     companion to some OTHER model's --mmproj flag (see config/model_options.json's
     extra_args), not a launchable model in their own right. llama.cpp itself
     writes general.architecture = "clip" into every projector it produces —
-    that's the authoritative signal (confirmed against a real mmproj-F16.gguf:
-    architecture 'clip', context_length None, ~447M "params" that are really
-    vision-tower weights). The filename substring is only a cheap secondary
-    check in case some other multimodal architecture ever uses a different
-    architecture string than "clip" — read_gguf_info() is what actually
-    decides this, not naming convention."""
-    return info["architecture"].lower() == "clip" or "mmproj" in fname.lower()
+    confirmed against a real mmproj-F16.gguf (architecture 'clip', context_length
+    None, ~447M "params" that are really vision-tower weights). Decided purely
+    from GGUF metadata — no filename heuristic."""
+    return info["architecture"].lower() == "clip"
 
 
 def discovered_model_names(models_dir):
@@ -204,7 +201,7 @@ def discovered_model_names(models_dir):
         except (OSError, ValueError, struct.error) as e:
             print(f"[warn] skipping '{fname}': could not read GGUF metadata ({e})")
             continue
-        if _is_mmproj_info(fname, info):
+        if _is_mmproj_info(info):
             continue
         names.append(fname[: shard_match.start()] if shard_match else fname[: -len(".gguf")])
     return names
@@ -234,7 +231,7 @@ def discover_models(models_dir, options=None):
         except (OSError, ValueError, struct.error) as e:
             print(f"[warn] skipping '{fname}': could not read GGUF metadata ({e})")
             continue
-        if _is_mmproj_info(fname, info):
+        if _is_mmproj_info(info):
             continue  # vision projector, not a launchable model — see _is_mmproj_info
 
         opt = options.get(name, {})
@@ -774,7 +771,7 @@ def cmd_inspect(args):
         except (OSError, ValueError, struct.error) as e:
             print(f"[warn] skipping '{fname}': could not read GGUF metadata ({e})")
             continue
-        if _is_mmproj_info(fname, info):
+        if _is_mmproj_info(info):
             continue  # vision projector, not a launchable model — see _is_mmproj_info
         rows.append((fname, info))
 
