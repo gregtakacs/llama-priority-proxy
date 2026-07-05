@@ -22,6 +22,9 @@ Config read at startup from --config-dir (default config/):
                               optional label override)
   standalone_models.json    - always-on models outside the scenario system
                               (nomic-embed-text), loaded once at startup
+  image_backend.json        - optional: ComfyUI reverse-proxy + coexistence
+                              settings (base_url/coexist_scenario/poll+revert
+                              delays) — absent means /comfyui/* returns 503
 
 Ports are fixed (see scenario/standalone config, not chosen dynamically here):
   11444 (this proxy, 0.0.0.0) / 11445 (standalone, 127.0.0.1) /
@@ -112,7 +115,11 @@ async def auth_middleware(request, handler):
     # entire API — see the incident this comment is here to prevent recurring.
     api_key = request.app["proxy_api_key"]
     exempt_paths = {"/health", "/dashboard", "/dashboard/", "/"}
-    if api_key and request.path not in exempt_paths:
+    # /comfyui/* is also exempt: ComfyUI has no auth of its own, and OpenWebUI's
+    # ComfyUI client may not attach the Authorization header to its websocket
+    # handshake — same trust posture as the llama-server children today
+    # (protected by network exposure, not an app-layer check).
+    if api_key and request.path not in exempt_paths and not request.path.startswith("/comfyui/"):
         auth = request.headers.get("Authorization", "")
         if auth != f"Bearer {api_key}":
             return openai_error(401, "Incorrect API key provided.", code="invalid_api_key")
@@ -153,6 +160,9 @@ def load_config(config_dir):
     registry = {m["name"]: m for m in
                 load_json(os.path.join(config_dir, "model_vram_registry.json"), {"models": []})["models"]}
     standalone = load_json(os.path.join(config_dir, "standalone_models.json"), {"models": []})["models"]
+    # Optional — the image-generation feature is entirely inert (routes under
+    # /comfyui return 503) if this file doesn't exist.
+    image_cfg = load_json(os.path.join(config_dir, "image_backend.json"), None)
 
     scenarios = {}
     for fname in sorted(os.listdir(config_dir)):
@@ -166,7 +176,7 @@ def load_config(config_dir):
         raise RuntimeError(f"expected exactly one scenario with \"default\": true, "
                             f"found {len(default_scenarios)}")
 
-    return options, registry, standalone, scenarios
+    return options, registry, standalone, scenarios, image_cfg
 
 
 def model_label(name, options, override=None):
@@ -255,6 +265,9 @@ class ProxyState:
         self.reserved_ctx = {}    # model name -> ctx size, for the active scenario
         self.http_session = None
         self.spawn_lock = asyncio.Lock()  # serialize scenario switches/spawns
+        self.image_cfg = None            # parsed config/image_backend.json, or None if absent
+        self.pre_comfy_scenario = None   # scenario active right before comfy_coexist took over
+        self.comfy_revert_task = None    # single in-flight watch_comfy_queue_and_revert task, or None
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +322,70 @@ async def evict_model(lm):
     await loop.run_in_executor(None, shutdown_server, lm.handle)
 
 
+# ---------------------------------------------------------------------------
+# Image-generation coexistence (ComfyUI) — the "small model" is just another
+# scenario (see config/scenario_comfy_coexist.json), reusing activate_scenario
+# entirely rather than needing separate eviction/spawn logic. See
+# handle_comfyui_proxy for where activate_comfy_coexist is actually triggered
+# (the moment a POST /comfyui/prompt comes through) and
+# watch_comfy_queue_and_revert for how the switch back is triggered.
+# ---------------------------------------------------------------------------
+
+async def activate_comfy_coexist(state):
+    """No-op if already active. Remembers whatever was actually active so
+    watch_comfy_queue_and_revert can restore it later instead of assuming
+    "default" — a chat could've been happening in a non-default scenario when
+    the image request interrupted it."""
+    coexist_name = state.image_cfg["coexist_scenario"]
+    if state.active_scenario == coexist_name:
+        return
+    state.pre_comfy_scenario = state.active_scenario
+    await activate_scenario(state, coexist_name, state.load_timeout_s)
+
+
+async def free_comfyui_memory(state):
+    """Best-effort — logs and swallows errors/timeouts, never raises (mirrors
+    the tolerant style wait_for_capacity already uses for /slots
+    unreachability): a ComfyUI hiccup here shouldn't block an LLM spawn."""
+    url = f"{state.image_cfg['base_url']}/free"
+    try:
+        async with state.http_session.post(url, json={"unload_models": True, "free_memory": True},
+                                            timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                print(f"[proxy] WARNING: ComfyUI /free returned HTTP {resp.status}")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[proxy] WARNING: failed to free ComfyUI memory: {e}")
+
+
+async def watch_comfy_queue_and_revert(state):
+    """Started after every forwarded /prompt (see handle_comfyui_proxy), which
+    cancels any previous instance first — only one of these runs at a time.
+    Polls ComfyUI's queue until it drains, waits a settle window to absorb
+    back-to-back submissions, then frees ComfyUI and restores whatever
+    scenario was active before comfy_coexist took over."""
+    cfg = state.image_cfg
+    url = f"{cfg['base_url']}/queue"
+    while True:
+        await asyncio.sleep(cfg["queue_poll_interval_s"])
+        try:
+            async with state.http_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                data = await resp.json()
+                if not data.get("queue_running") and not data.get("queue_pending"):
+                    break
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+            break  # can't tell — don't hold the coexistence model hostage indefinitely
+
+    await asyncio.sleep(cfg["revert_delay_s"])
+    async with state.spawn_lock:
+        if state.active_scenario != cfg["coexist_scenario"]:
+            return  # already legitimately preempted by something else (e.g. a vision request)
+        # activate_scenario's own hook frees ComfyUI's memory as part of
+        # leaving comfy_coexist — no need to duplicate that call here.
+        target = state.pre_comfy_scenario or next(name for name, s in state.scenarios.items() if s.get("default"))
+        print(f"[proxy] ComfyUI queue drained — reverting to '{target}'")
+        await activate_scenario(state, target, state.load_timeout_s)
+
+
 async def activate_scenario(state, scenario_name, load_timeout_s):
     """Evict whatever the new scenario doesn't want, group-solve ctx sizes for
     all its members at once, and switch. A model shared by both the outgoing
@@ -318,6 +395,13 @@ async def activate_scenario(state, scenario_name, load_timeout_s):
     would reserve for it: llama-server's ctx is fixed at launch, so a size
     mismatch means a relaunch is unavoidable, not just an optimization we're
     skipping."""
+    if (state.image_cfg is not None and scenario_name != state.active_scenario
+            and state.active_scenario == state.image_cfg.get("coexist_scenario")):
+        # Leaving comfy_coexist via some path other than the queue-watcher
+        # (e.g. a vision request forcing a real switch) — free ComfyUI too,
+        # since the coexistence model is being evicted anyway.
+        await free_comfyui_memory(state)
+
     scenario = state.scenarios[scenario_name]
     gpu_total = gpu_total_bytes(state.gpu_index)
     # Standalone models (nomic) are always resident and never evicted — their
@@ -325,7 +409,8 @@ async def activate_scenario(state, scenario_name, load_timeout_s):
     # treat it the same as headroom, not as capacity it could ever claim.
     standalone_vram = sum(predicted_vram(state.registry[lm.name], lm.ctx_size)
                            for lm in state.standalone_loaded.values())
-    budget = gpu_total - int(state.headroom_gb * (1024 ** 3)) - standalone_vram
+    budget = (gpu_total - int(state.headroom_gb * (1024 ** 3)) - standalone_vram
+              - scenario.get("comfy_reserved_vram_bytes", 0))
     new_sizes = solve_scenario_sizes(scenario, state.registry, budget)
 
     new_names = {m["name"] for m in scenario["models"]}
@@ -345,22 +430,29 @@ async def eager_load_pinned_members(state, scenario_name, load_timeout_s):
     """keep_alive: -1 on a scenario member means eager-load it the moment its
     scenario becomes active, not lazily on first request — see the "default
     scenario + keep_alive: -1" design discussion. Applies on any activation,
-    not just reversion to the default scenario."""
+    not just reversion to the default scenario.
+
+    A member can also be marked "eager": true directly in the scenario's own
+    config, independent of the model's global keep_alive — used by
+    comfy_coexist (see its _comment) so its one model loads the instant that
+    scenario activates rather than waiting for a chat request to trigger the
+    normal on-demand spawn path, without changing that same model's (lazy)
+    behavior in any other scenario it also appears in."""
     scenario = state.scenarios[scenario_name]
     for m in scenario["models"]:
         if m["name"] in state.loaded:
             continue
         keep_alive = state.options.get(m["name"], {}).get("keep_alive", "")
-        if parse_keep_alive(keep_alive) is not None:
-            continue  # not pinned — stays lazy
+        if parse_keep_alive(keep_alive) is not None and not m.get("eager", False):
+            continue  # not pinned, and not scenario-forced-eager — stays lazy
         port = scenario["port"] if m.get("slot", "primary") == "primary" else scenario["port_secondary"]
         ctx = state.reserved_ctx[m["name"]]
         try:
             lm = await spawn_model(state, m["name"], port, ctx, load_timeout_s)
             state.loaded[m["name"]] = lm
-            print(f"[proxy] eager-loaded pinned (keep_alive=-1) model '{m['name']}' for scenario '{scenario_name}'")
+            print(f"[proxy] eager-loaded model '{m['name']}' for scenario '{scenario_name}'")
         except RuntimeError as e:
-            print(f"[proxy] WARNING: failed to eager-load pinned model '{m['name']}': {e}")
+            print(f"[proxy] WARNING: failed to eager-load model '{m['name']}': {e}")
 
 
 def model_supports_vision(state, name):
@@ -636,8 +728,19 @@ async def handle_completion(request):
                         print(f"[proxy] '{alias.name}' (fallback alias) request failed after {type(e).__name__}: {e} (not evicting)")
                         return openai_error(503, f"Request to '{requested_label}' failed: {e}", code="request_failed")
                 # Nothing resident can cover it (or, for an image request, nothing
-                # resident that both covers it and can actually see) — no cheaper
-                # option than switching.
+                # resident that both covers it and can actually see) — normally
+                # "no cheaper option than switching", EXCEPT when comfy_coexist
+                # is active (see the check just below): ComfyUI is still
+                # holding its reserved VRAM chunk for the entire time that
+                # scenario is active, so a real switch here would evict the
+                # coexistence model for nothing — whatever we tried to load
+                # can't actually fit until ComfyUI itself releases that memory
+                # (i.e. until watch_comfy_queue_and_revert's own revert runs).
+            if (state.image_cfg is not None
+                    and state.active_scenario == state.image_cfg.get("coexist_scenario")):
+                return openai_error(503, f"Image generation is active and holding GPU memory — "
+                                          f"'{requested_label}' can't be loaded until it finishes.",
+                                     code="image_generation_busy")
             await activate_scenario(state, scenario_name, state.load_timeout_s)
 
         lm = state.loaded.get(target["name"])
@@ -719,6 +822,10 @@ async def handle_status(request):
              "active": s["name"] == state.active_scenario}
             for s in state.scenarios.values()
         ],
+        "image_backend": (None if state.image_cfg is None else {
+            "active": state.active_scenario == state.image_cfg["coexist_scenario"],
+            "pre_comfy_scenario": state.pre_comfy_scenario,
+        }),
     })
 
 
@@ -757,6 +864,87 @@ async def handle_slots_port(request):
             return web.json_response(data, status=resp.status)
     except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
         return web.json_response([], status=200)  # empty slots if child unreachable
+
+
+_HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+                "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
+
+
+async def _relay_ws(source, dest):
+    """Pumps frames from source to dest, preserving TEXT vs BINARY (ComfyUI's
+    progress socket sends binary preview-image frames) until either side
+    closes. A dumb passthrough — completion detection for the coexistence
+    swap is done independently via watch_comfy_queue_and_revert, not by
+    inspecting these frames."""
+    async for msg in source:
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            await dest.send_str(msg.data)
+        elif msg.type == aiohttp.WSMsgType.BINARY:
+            await dest.send_bytes(msg.data)
+        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+            break
+
+
+async def handle_comfyui_proxy(request):
+    """Reverse-proxies everything under /comfyui/* to the real ComfyUI
+    instance. Deliberately NOT the JSON/SSE-aware forward() used for chat:
+    ComfyUI's own protocol (POST /prompt, GET /history/{id}, GET /view, and a
+    progress websocket at /ws) isn't OpenAI-shaped, and /view returns raw
+    image bytes.
+
+    The one place this does more than blind passthrough: a POST to /prompt
+    (the only call that actually triggers ComfyUI loading a checkpoint)
+    activates the comfy_coexist scenario first, guaranteeing VRAM headroom
+    exists before ComfyUI ever starts loading — see activate_comfy_coexist."""
+    state = request.app["state"]
+    if state.image_cfg is None:
+        return openai_error(503, "Image generation is not configured (no config/image_backend.json).")
+
+    tail = request.match_info["tail"]
+    if request.method == "POST" and tail == "prompt":
+        if state.comfy_revert_task is not None and not state.comfy_revert_task.done():
+            state.comfy_revert_task.cancel()
+        async with state.spawn_lock:
+            try:
+                await activate_comfy_coexist(state)
+            except RuntimeError as e:
+                return openai_error(503, str(e))
+
+    target_url = f"{state.image_cfg['base_url']}/{tail}"
+    if request.query_string:
+        target_url += f"?{request.query_string}"
+
+    if request.headers.get("Upgrade", "").lower() == "websocket":
+        ws_server = web.WebSocketResponse()
+        await ws_server.prepare(request)
+        async with state.http_session.ws_connect(target_url) as ws_client:
+            tasks = [asyncio.create_task(_relay_ws(ws_server, ws_client)),
+                     asyncio.create_task(_relay_ws(ws_client, ws_server))]
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        if not ws_server.closed:
+            await ws_server.close()
+        return ws_server
+
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS}
+    body = await request.read()
+    async with state.http_session.request(request.method, target_url, headers=headers, data=body,
+                                           timeout=aiohttp.ClientTimeout(total=1800)) as resp:
+        response = web.StreamResponse(
+            status=resp.status,
+            headers={"Content-Type": resp.headers.get("Content-Type", "application/octet-stream")},
+        )
+        await response.prepare(request)
+        async for chunk in resp.content.iter_chunked(65536):
+            await response.write(chunk)
+        await response.write_eof()
+
+    if request.method == "POST" and tail == "prompt":
+        state.comfy_revert_task = asyncio.create_task(watch_comfy_queue_and_revert(state))
+
+    return response
 
 
 async def handle_dashboard(request):
@@ -1449,6 +1637,8 @@ async def on_startup(app):
 async def on_cleanup(app):
     state = app["state"]
     state.idle_sweep_task.cancel()
+    if state.comfy_revert_task is not None and not state.comfy_revert_task.done():
+        state.comfy_revert_task.cancel()
     for lm in list(state.loaded.values()) + list(state.standalone_loaded.values()):
         await evict_model(lm)
     await state.http_session.close()
@@ -1469,6 +1659,7 @@ def build_app(state, proxy_api_key):
     app.router.add_get("/status", handle_status)
     app.router.add_post("/scenarios/{name}/activate", handle_activate_scenario)
     app.router.add_get("/slots/{port}", handle_slots_port)
+    app.router.add_route("*", "/comfyui/{tail:.*}", handle_comfyui_proxy)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/dashboard", handle_dashboard)
     app.router.add_get("/", handle_dashboard)  # / → dashboard
@@ -1499,7 +1690,7 @@ def main():
     state.headroom_gb = args.headroom_gb
     state.load_timeout_s = args.load_timeout
     state.max_wait_s = args.max_wait
-    state.options, state.registry, state.standalone, state.scenarios = load_config(args.config_dir)
+    state.options, state.registry, state.standalone, state.scenarios, state.image_cfg = load_config(args.config_dir)
     state.label_index = build_label_index(state.scenarios, state.standalone, state.options)
 
     proxy_api_key = read_secret_file("PROXY_API_KEY")
