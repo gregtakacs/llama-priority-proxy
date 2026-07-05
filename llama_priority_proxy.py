@@ -798,16 +798,28 @@ async def handle_status(request):
     # nothing gets evicted on idle no matter how long it's been sitting there.
     active_is_default = (state.active_scenario is not None
                           and state.scenarios[state.active_scenario].get("default", False))
+    scenario_models = []
+    if state.active_scenario is not None:
+        scenario = state.scenarios[state.active_scenario]
+        for m in scenario["models"]:
+            lm = state.loaded.get(m["name"])
+            port = scenario["port"] if m.get("slot", "primary") == "primary" else scenario["port_secondary"]
+            keep_alive = state.options.get(m["name"], {}).get("keep_alive", "")
+            scenario_models.append({
+                "name": m["name"],
+                "label": m.get("label", m["name"]),
+                "slot": m.get("slot", "primary"),
+                "port": port,
+                "ctx_size": state.reserved_ctx.get(m["name"]),
+                "loaded": lm is not None,
+                "keep_alive": keep_alive,
+                "idle_for_s": None if lm is None else round(now - lm.last_used, 1),
+                "evict_in_s": (None if lm is None or active_is_default or parse_keep_alive(keep_alive) is None
+                               else round(max(0.0, parse_keep_alive(keep_alive) - (now - lm.last_used)), 1)),
+            })
     return web.json_response({
         "active_scenario": state.active_scenario,
-        "loaded_models": [
-            {"name": lm.name, "port": lm.port, "ctx_size": lm.ctx_size,
-             "idle_for_s": round(now - lm.last_used, 1),
-             "keep_alive": lm.keep_alive,
-             "evict_in_s": (None if active_is_default or parse_keep_alive(lm.keep_alive) is None
-                            else round(max(0.0, parse_keep_alive(lm.keep_alive) - (now - lm.last_used)), 1))}
-            for lm in state.loaded.values()
-        ],
+        "scenario_models": scenario_models,
         "standalone_models": [
             {"name": lm.name, "port": lm.port, "ctx_size": lm.ctx_size}
             for lm in state.standalone_loaded.values()
@@ -848,6 +860,46 @@ async def handle_activate_scenario(request):
             except RuntimeError as e:
                 return openai_error(503, str(e))
     return web.json_response({"active_scenario": state.active_scenario})
+
+
+async def handle_load_model(request):
+    """POST /models/{name}/load — manual force-load from the dashboard. Only
+    valid for a member of the currently active scenario: that's what pins down
+    which port/ctx-size to launch it on (state.reserved_ctx, solved once at
+    scenario activation — see solve_scenario_sizes). A no-op if already
+    loaded, same idempotent shape as handle_activate_scenario."""
+    state = request.app["state"]
+    name = request.match_info["name"]
+    if state.active_scenario is None:
+        return openai_error(409, "No active scenario.", code="no_active_scenario")
+    scenario = state.scenarios[state.active_scenario]
+    model_def = next((m for m in scenario["models"] if m["name"] == name), None)
+    if model_def is None:
+        return openai_error(404, f"'{name}' is not a member of the active scenario '{state.active_scenario}'.",
+                             code="model_not_found")
+    async with state.spawn_lock:
+        if name not in state.loaded:
+            port = scenario["port"] if model_def.get("slot", "primary") == "primary" else scenario["port_secondary"]
+            ctx = state.reserved_ctx[name]
+            try:
+                state.loaded[name] = await spawn_model(state, name, port, ctx, state.load_timeout_s)
+            except RuntimeError as e:
+                return openai_error(503, str(e))
+    return web.json_response({"name": name, "loaded": True})
+
+
+async def handle_evict_model(request):
+    """POST /models/{name}/evict — manual force-evict from the dashboard.
+    A no-op if already not loaded. Doesn't touch state.active_scenario or
+    state.reserved_ctx — the model simply stays absent until the next
+    scenario activation (or a future force-load) brings it back."""
+    state = request.app["state"]
+    name = request.match_info["name"]
+    async with state.spawn_lock:
+        lm = state.loaded.pop(name, None)
+        if lm is not None:
+            await evict_model(lm)
+    return web.json_response({"name": name, "loaded": False})
 
 
 async def handle_slots_port(request):
@@ -1055,6 +1107,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .status-ok { background: rgba(74,222,128,0.12); color: var(--green); }
   .status-err { background: rgba(248,113,113,0.12); color: var(--red); }
   .status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .model-status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .model-status-dot { width: 9px; height: 9px; border-radius: 50%; }
+  .model-status-dot.dot-green { background: var(--green); box-shadow: 0 0 6px rgba(74,222,128,0.6); }
+  .model-status-dot.dot-red { background: var(--red); }
   .scenario-name { font-size: 1.6rem; font-weight: 700; color: var(--accent); }
   .scenario-meta { color: var(--text-dim); font-size: 0.82rem; margin-top: 4px; }
   .gpu-bar-wrap { height: 14px; background: var(--bg); border-radius: 7px; overflow: hidden; margin-top: 8px; }
@@ -1140,7 +1196,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <div class="card-title">Loaded Models</div>
+      <div class="card-title">Scenario Models</div>
       <div id="modelsTable"></div>
     </div>
 
@@ -1329,6 +1385,7 @@ function fmtIdle(secs) {
 
 function fmtEvict(m) {
   if (!('keep_alive' in m)) return '—';  // standalone model — never subject to idle eviction
+  if ('loaded' in m && !m.loaded) return '—';  // scenario model not currently loaded
   if (m.keep_alive === '-1') return 'pinned';
   if (m.evict_in_s == null) return '—';  // default scenario active — idle eviction doesn't apply right now
   return m.evict_in_s <= 0 ? 'due' : `in ${fmtIdle(m.evict_in_s)}`;
@@ -1364,14 +1421,14 @@ function hideError() {
 function renderStatus(data) {
   document.getElementById('activeScenario').textContent = data.active_scenario || 'None';
   const activeScenarioDef = data.scenarios?.find(s => s.active);
-  const activeModels = data.loaded_models || [];
-  const activeModelNames = activeModels.map(m => m.name);
+  const scenarioModels = data.scenario_models || [];
+  const loadedCount = scenarioModels.filter(m => m.loaded).length;
   let metaParts = [];
   if (activeScenarioDef) {
     metaParts.push(`Priority: ${activeScenarioDef.priority}`);
     if (activeScenarioDef.default) metaParts.push('Default');
   }
-  metaParts.push(`${activeModelNames.length} model${activeModelNames.length !== 1 ? 's' : ''} in scenario`);
+  metaParts.push(`${loadedCount}/${scenarioModels.length} model${scenarioModels.length !== 1 ? 's' : ''} loaded`);
   document.getElementById('scenarioMeta').textContent = metaParts.join(' · ');
 
   document.getElementById('lastUpdate').textContent = `Last update: ${new Date().toLocaleTimeString()}`;
@@ -1391,10 +1448,117 @@ function renderStatus(data) {
     else bar.style.background = 'linear-gradient(90deg, #4ade80, #facc15)';
   }
 
-  renderModelsTable(data.loaded_models || [], 'modelsTable', 'modelSlotCache');
+  renderScenarioModelsTable(data.scenario_models || []);
   renderModelsTable(data.standalone_models || [], 'standaloneModels', 'standaloneSlotCache');
   renderScenariosList(data.scenarios || []);
 }
+
+// ---- Scenario models table (all models defined by the active scenario,
+// loaded or not, each with a force load/evict button) ----
+function renderScenarioModelsTable(models) {
+  const container = document.getElementById('modelsTable');
+  if (models.length === 0) {
+    container.innerHTML = '<div class="empty">No active scenario</div>';
+    return;
+  }
+
+  const slotCache = window.modelSlotCache = window.modelSlotCache || {};
+
+  const currentModels = new Set();
+  container.querySelectorAll('tr[data-model]').forEach(tr => {
+    currentModels.add(tr.getAttribute('data-model'));
+  });
+  const newModels = new Set(models.map(m => m.name));
+  const needRebuild = currentModels.size !== newModels.size ||
+                      ![...newModels].every(k => currentModels.has(k)) ||
+                      ![...currentModels].every(k => newModels.has(k));
+
+  if (needRebuild) {
+    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Status</th><th>Processes</th><th>Idle</th><th>Evicts</th><th></th></tr></thead><tbody>`;
+    for (const m of models) {
+      html += scenarioModelRowHtml(m);
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } else {
+    for (const m of models) {
+      const row = container.querySelector(`tr[data-model="${m.name}"]`);
+      if (!row) continue;
+      // Only replace the whole row (status dot + action button) when the
+      // loaded state actually flipped — otherwise a mid-flight button
+      // (disabled, "Loading…") would get reset by the next poll tick before
+      // the force-load/evict request it belongs to has even completed.
+      if ((row.getAttribute('data-loaded') === 'true') !== m.loaded) {
+        row.outerHTML = scenarioModelRowHtml(m);
+        continue;
+      }
+      const idleCell = row.querySelector('.idle-cell');
+      if (idleCell) {
+        idleCell.dataset.idleS = m.idle_for_s != null ? m.idle_for_s : '';
+        if (!idleCell.classList.contains('is-active')) {
+          idleCell.textContent = m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—';
+        }
+      }
+      const evictCell = row.querySelector('.evict-cell');
+      if (evictCell) evictCell.textContent = fmtEvict(m);
+    }
+  }
+
+  for (const m of models) {
+    if (m.loaded) fetchSlots(m.port);
+  }
+}
+
+function scenarioModelRowHtml(m) {
+  const slotCache = window.modelSlotCache || {};
+  const slotInfo = slotCache[m.port] || { slots: 0, running: 0, loaded: false };
+  const numDots = slotInfo.slots || 1;
+  const indicators = m.loaded ? Array.from({length: numDots}, (_, i) => {
+    const active = i < slotInfo.running;
+    return `<div class="proc-dot${active ? ' active' : ''}"></div>`;
+  }).join('') : '';
+  const procLabel = !m.loaded ? '—' : (slotInfo.loaded ? `${slotInfo.running}/${slotInfo.slots}` : 'loading...');
+  const statusHtml = `<span class="model-status"><span class="model-status-dot ${m.loaded ? 'dot-green' : 'dot-red'}"></span>${m.loaded ? 'Loaded' : 'Not loaded'}</span>`;
+  const action = m.loaded ? 'evict' : 'load';
+  const actionLabel = m.loaded ? 'Evict' : 'Load';
+  return `<tr data-model="${m.name}" data-loaded="${m.loaded}">
+    <td class="model-name">${m.label}<small>${m.slot} · ctx ${m.ctx_size != null ? fmtNum(m.ctx_size) : '—'}</small></td>
+    <td>${m.port}</td>
+    <td class="status-cell">${statusHtml}</td>
+    <td class="proc-cell" data-port="${m.port}"><div class="proc-indicators">${indicators}<span class="proc-label">${procLabel}</span></div></td>
+    <td class="idle-cell" data-idle-s="${m.idle_for_s != null ? m.idle_for_s : ''}">${m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—'}</td>
+    <td class="evict-cell">${fmtEvict(m)}</td>
+    <td class="action-cell"><button class="btn-sm" data-action="${action}" data-model="${m.name}">${actionLabel}</button></td>
+  </tr>`;
+}
+
+document.getElementById('modelsTable').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const action = btn.getAttribute('data-action');
+  const name = btn.getAttribute('data-model');
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = action === 'load' ? 'Loading…' : 'Evicting…';
+  hideError();
+  try {
+    const resp = await fetch(`/models/${encodeURIComponent(name)}/${action}`, { method: 'POST', headers: authHeaders() });
+    if (resp.status === 401) {
+      clearStoredKey();
+      showLogin('Invalid or expired API key.');
+      return;
+    }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => null);
+      throw new Error(body?.error?.message || `HTTP ${resp.status}`);
+    }
+    await fetchAndRender();
+  } catch (err) {
+    showError(err.message);
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});
 
 function renderModelsTable(models, containerId, cacheKey) {
   const container = document.getElementById(containerId);
@@ -1658,6 +1822,8 @@ def build_app(state, proxy_api_key):
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/status", handle_status)
     app.router.add_post("/scenarios/{name}/activate", handle_activate_scenario)
+    app.router.add_post("/models/{name}/load", handle_load_model)
+    app.router.add_post("/models/{name}/evict", handle_evict_model)
     app.router.add_get("/slots/{port}", handle_slots_port)
     app.router.add_route("*", "/comfyui/{tail:.*}", handle_comfyui_proxy)
     app.router.add_get("/health", handle_health)

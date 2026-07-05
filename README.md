@@ -25,6 +25,7 @@ Client → :11444 (this proxy)
              ├── /v1/models             →  list all available labels
              ├── /status                →  current state (scenarios, GPU, loaded models)
              ├── /scenarios/{name}/activate →  manually force a scenario switch
+             ├── /models/{name}/load, /evict →  manually force-load/evict a model in the active scenario
              ├── /slots/{port}          →  same-origin proxy to a child's /slots (dashboard use)
              ├── /dashboard, /          →  status dashboard (HTML/JS, no auth — see Authentication)
              └── /health                →  health check (no auth required)
@@ -239,6 +240,8 @@ python llama_priority_proxy.py --models-dir /path/to/models --config-dir config 
 | `/v1/models` | GET | Yes | List available model labels |
 | `/status` | GET | Yes | Current proxy state (GPU, scenarios, loaded models) |
 | `/scenarios/{name}/activate` | POST | Yes | Manually force a scenario switch (bypasses priority — see Dashboard) |
+| `/models/{name}/load` | POST | Yes | Force-load a model belonging to the active scenario (no-op if already loaded — see Dashboard) |
+| `/models/{name}/evict` | POST | Yes | Force-evict a currently loaded model (no-op if not loaded — see Dashboard) |
 | `/slots/{port}` | GET | Yes | Same-origin proxy to a child's own `/slots` (used by the dashboard) |
 | `/dashboard`, `/` | GET | No | Status dashboard shell (HTML/JS only — see Authentication) |
 | `/health` | GET | No | Health check (Docker HEALTHCHECK) |
@@ -259,13 +262,15 @@ Authorization: Bearer <your-api-key>
 A single-page status dashboard is served at `/dashboard` (`/` serves the identical page directly, not a redirect) — no separate build step or static files, the HTML/JS is embedded directly in `llama_priority_proxy.py`.
 
 **What it shows:**
-- Active scenario, its priority, and how many models it has resident
-- Loaded models per scenario (port, context size, idle time) and standalone models
+- Active scenario, its priority, and how many of its models are currently loaded
+- Every model defined by the active scenario (not just the ones currently loaded) — port, context size, idle time, and a green/red dot for whether it's actually resident — plus standalone models
 - Live per-slot activity — one dot per parallel slot, lit up while that slot is actively processing (polled from each child's own `/slots` via the proxy's same-origin `/slots/{port}` route, avoiding CORS issues from hitting child processes directly)
 - GPU VRAM used/free
 - All configured scenarios, with the active one highlighted
 
 **Manual scenario switching:** clicking a non-active scenario opens a confirm modal (it warns that switching evicts the current scenario's models and can take up to a minute to load the new one) and, on confirm, calls `POST /scenarios/{name}/activate`. This is a one-time override, not a pin — normal priority-based routing resumes immediately afterward, so the next request for a higher-priority scenario switches right back.
+
+**Manual model load/evict:** each row in the active scenario's model table has a Load or Evict button, backed by `POST /models/{name}/load` and `POST /models/{name}/evict`. These only work for members of the *currently active* scenario (that's what determines which port and reserved context size to launch on) and are idempotent — loading an already-loaded model or evicting an already-absent one is a no-op. A force-evicted model stays absent until the next scenario activation (or another force-load) brings it back, even if it's `keep_alive: -1` pinned.
 
 **Auth flow:** the dashboard page itself loads with no key (see Authentication above), then shows a login gate prompting for the same `PROXY_API_KEY` used everywhere else. The key is kept in `sessionStorage` for that browser tab only — never `localStorage`, never sent anywhere but back to this same proxy as a Bearer header. A wrong key or a `401` mid-session (e.g. the key changed) clears the stored value and re-shows the login gate. There's a logout button that clears it manually.
 
