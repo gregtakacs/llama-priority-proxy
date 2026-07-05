@@ -263,6 +263,29 @@ class ProxyState:
 # 10-60s model load doesn't stall the whole event loop.
 # ---------------------------------------------------------------------------
 
+_SAMPLING_FLAGS = {
+    "temp": "--temp",
+    "top_k": "--top-k",
+    "top_p": "--top-p",
+    "min_p": "--min-p",
+    "repeat_penalty": "--repeat-penalty",
+    "repeat_last_n": "--repeat-last-n",
+    "presence_penalty": "--presence-penalty",
+    "frequency_penalty": "--frequency-penalty",
+}
+
+
+def sampling_args(opt):
+    """Translate model_options.json's named sampling fields into llama-server
+    CLI flags. These only seed the server-side default — a client that sends
+    its own temperature/top_p/etc. per-request still overrides them."""
+    args = []
+    for key, flag in _SAMPLING_FLAGS.items():
+        if key in opt:
+            args += [flag, str(opt[key])]
+    return args
+
+
 async def spawn_model(state, name, port, ctx, load_timeout_s):
     opt = state.options.get(name, {})
     path = os.path.join(state.models_dir, f"{name}.gguf")
@@ -271,7 +294,7 @@ async def spawn_model(state, name, port, ctx, load_timeout_s):
 
     handle = await loop.run_in_executor(
         None, launch_server, path, ctx, parallel, port,
-        opt.get("n_gpu_layers", 99), opt.get("extra_args", []), {"kind": "native"},
+        opt.get("n_gpu_layers", 99), opt.get("extra_args", []) + sampling_args(opt), {"kind": "native"},
     )
     ok, reason = await loop.run_in_executor(None, wait_for_health, handle, load_timeout_s)
     if not ok:

@@ -87,6 +87,17 @@ CTX_RETRY_FALLBACKS = [131072, 65536, 32768, 16384, 8192, 4096, 2048, 1024]
 
 DEFAULT_HEADROOM_GB = 1.0  # reserved for driver/desktop/other overhead
 
+# Anchored to this script's own directory rather than left as bare relative
+# paths — otherwise `--write-options`'s default silently resolves against
+# whatever the shell's cwd happens to be, and a script that's supposed to be a
+# safe no-op on an existing config instead creates a fresh, defaults-only file
+# there (this is what wiped out hand-edited sampling params once already).
+_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
+
+
+def _default_config_path(filename):
+    return os.path.join(_CONFIG_DIR, filename)
+
 # Fallback used only when a GGUF has no discoverable context_length metadata.
 DEFAULT_MAX_CTX = 32768
 
@@ -693,6 +704,17 @@ _BENCH_OPTIONS_COMMENT = [
     "                             (\"5m\", \"10s\", \"66h\") or \"-1\" for never evict.",
     "                             NOT wired up yet — reserved for the proxy; changing",
     "                             it does not affect benchmarking or trigger a re-bench.",
+    "",
+    "Sampling defaults (all optional, all passed straight through as llama-server",
+    "CLI flags at spawn — see spawn_model()/sampling_args() in llama_priority_proxy.py):",
+    "  temp, top_k, top_p, min_p, repeat_penalty, repeat_last_n,",
+    "  presence_penalty, frequency_penalty",
+    "These only set the server-side DEFAULT — a client that sends its own",
+    "temperature/top_p/etc. in the request body still overrides them per-request.",
+    "Meaningless for embedding models (no token sampling happens); omit for those.",
+    "llama-server's own built-in defaults (temp=0.8, top_k=40, top_p=0.95, min_p=0.05,",
+    "repeat_penalty=1.0 i.e. DISABLED, no presence/frequency penalty) are why an",
+    "unconfigured model can fall into a repeat loop — nothing discourages it.",
 ]
 
 # Cosmetic/proxy-facing fields — deliberately NOT part of config_signature, since
@@ -747,7 +769,12 @@ def write_options_file(path, names, embedding_names=None):
         if changed:
             backfilled.append(name)
 
-    data["options"] = dict(sorted(data["options"].items()))  # keep the file alphabetical, always
+    # Rebuild with a fixed key order (_comment then options) rather than relying
+    # on whatever order the dict happened to accumulate keys in — a freshly
+    # created file (no os.path.exists(path) above) would otherwise get
+    # "options" first and "_comment" appended after, since that's insertion
+    # order for a dict built as {"options": {}} then assigned "_comment" later.
+    data = {"_comment": data["_comment"], "options": dict(sorted(data["options"].items()))}
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -855,12 +882,12 @@ def main():
 
     b = sub.add_parser("bench", help="Measure VRAM footprint of models via llama-server")
     b.add_argument("--models-dir", required=True, help="Auto-discover *.gguf files here (name/path/max_ctx all inferred)")
-    b.add_argument("--options", default="config/model_options.json",
+    b.add_argument("--options", default=_default_config_path("model_options.json"),
                    help="model_options.json — per-model options keyed by discovered name "
                         "(parallel/min_ctx/max_ctx/extra_args/n_gpu_layers). "
                         "Generate/refresh one with `inspect --write-options`. "
                         "(default: %(default)s)")
-    b.add_argument("--output", default="config/model_vram_registry.json", help="Registry output path")
+    b.add_argument("--output", default=_default_config_path("model_vram_registry.json"), help="Registry output path")
     b.add_argument("--model", help="Only benchmark this one model name")
     b.add_argument("--force", action="store_true", help="Re-measure even if already in registry")
     b.add_argument("--port", type=int, default=18080, help="Scratch port for the benchmark server")
@@ -877,14 +904,14 @@ def main():
 
     i = sub.add_parser("inspect", help="List *.gguf files with metadata-derived params/native context (no GPU needed)")
     i.add_argument("--models-dir", required=True)
-    i.add_argument("--write-options", default="config/model_options.json",
+    i.add_argument("--write-options", default=_default_config_path("model_options.json"),
                    help="Create/refresh this model_options.json with a default {parallel: 1} entry "
                         "for every discovered model — the recommended first step before `bench`. "
                         "Existing entries are left untouched. (default: %(default)s)")
     i.set_defaults(func=cmd_inspect)
 
     s = sub.add_parser("solve", help="Solve max ctx-size for a VRAM budget")
-    s.add_argument("--registry", default="config/model_vram_registry.json")
+    s.add_argument("--registry", default=_default_config_path("model_vram_registry.json"))
     s.add_argument("--budget-gb", type=float, help="VRAM budget in GB (default: detected total - headroom)")
     s.add_argument("--headroom-gb", type=float, default=DEFAULT_HEADROOM_GB)
     s.add_argument("--gpu-index", type=int, default=0)
@@ -896,7 +923,7 @@ def main():
                         "it fits the budget — the actual question you're usually asking, vs. the "
                         "default 'maximize total ctx-size' behavior when this is omitted.")
     s.add_argument("--scenario", help="Multi-model scenario JSON (see config/scenario_coding.json)")
-    s.add_argument("--options", default="config/model_options.json",
+    s.add_argument("--options", default=_default_config_path("model_options.json"),
                    help="Checked against the registry's stored config_signature on every run — "
                         "warns if model_options.json has changed since a model was last "
                         "benchmarked (default: %(default)s). Pass --options '' to skip this check.")
