@@ -172,28 +172,39 @@ def read_gguf_info(path):
 _SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 
 
-def _is_mmproj_file(fname):
-    """mmproj-*.gguf (vision projector) files are real GGUFs — read_gguf_info
-    parses them fine — but they're a companion to another model's --mmproj
-    flag (see config/model_options.json's extra_args), not a launchable model
-    in their own right. llama.cpp's own ecosystem convention is consistently
-    to put "mmproj" somewhere in the filename (mmproj-F16.gguf, mmproj-BF16.gguf,
-    <model>-mmproj-f16.gguf, ...), so filter on that rather than trying to
-    infer it from GGUF metadata."""
-    return "mmproj" in fname.lower()
+def _is_mmproj_info(fname, info):
+    """mmproj-*.gguf (vision projector) files are real, readable GGUFs — but a
+    companion to some OTHER model's --mmproj flag (see config/model_options.json's
+    extra_args), not a launchable model in their own right. llama.cpp itself
+    writes general.architecture = "clip" into every projector it produces —
+    that's the authoritative signal (confirmed against a real mmproj-F16.gguf:
+    architecture 'clip', context_length None, ~447M "params" that are really
+    vision-tower weights). The filename substring is only a cheap secondary
+    check in case some other multimodal architecture ever uses a different
+    architecture string than "clip" — read_gguf_info() is what actually
+    decides this, not naming convention."""
+    return info["architecture"].lower() == "clip" or "mmproj" in fname.lower()
 
 
 def discovered_model_names(models_dir):
     """Just the name-deriving pass of discover_models(), for building/refreshing
-    a model_options.json without needing to read every GGUF's metadata twice."""
+    a model_options.json. Still reads each file's header (read_gguf_info doesn't
+    touch tensor data, so this is cheap even for huge models) — needed to filter
+    out mmproj files by architecture, not just by name."""
     names = []
     for fname in sorted(os.listdir(models_dir)):
         if not fname.lower().endswith(".gguf"):
             continue
-        if _is_mmproj_file(fname):
-            continue
         shard_match = _SHARD_RE.search(fname)
         if shard_match and shard_match.group(1) != "00001":
+            continue
+        path = os.path.join(models_dir, fname)
+        try:
+            info = read_gguf_info(path)
+        except (OSError, ValueError, struct.error) as e:
+            print(f"[warn] skipping '{fname}': could not read GGUF metadata ({e})")
+            continue
+        if _is_mmproj_info(fname, info):
             continue
         names.append(fname[: shard_match.start()] if shard_match else fname[: -len(".gguf")])
     return names
@@ -212,8 +223,6 @@ def discover_models(models_dir, options=None):
     for fname in sorted(os.listdir(models_dir)):
         if not fname.lower().endswith(".gguf"):
             continue
-        if _is_mmproj_file(fname):
-            continue  # vision projector, not a launchable model — see _is_mmproj_file
         shard_match = _SHARD_RE.search(fname)
         if shard_match and shard_match.group(1) != "00001":
             continue  # only the first shard is a load target; rest follow automatically
@@ -225,6 +234,8 @@ def discover_models(models_dir, options=None):
         except (OSError, ValueError, struct.error) as e:
             print(f"[warn] skipping '{fname}': could not read GGUF metadata ({e})")
             continue
+        if _is_mmproj_info(fname, info):
+            continue  # vision projector, not a launchable model — see _is_mmproj_info
 
         opt = options.get(name, {})
         max_ctx = opt.get("max_ctx") or info["context_length"] or DEFAULT_MAX_CTX
@@ -754,8 +765,6 @@ def cmd_inspect(args):
     for fname in sorted(os.listdir(args.models_dir)):
         if not fname.lower().endswith(".gguf"):
             continue
-        if _is_mmproj_file(fname):
-            continue  # vision projector, not a launchable model — see _is_mmproj_file
         shard_match = _SHARD_RE.search(fname)
         if shard_match and shard_match.group(1) != "00001":
             continue
@@ -765,6 +774,8 @@ def cmd_inspect(args):
         except (OSError, ValueError, struct.error) as e:
             print(f"[warn] skipping '{fname}': could not read GGUF metadata ({e})")
             continue
+        if _is_mmproj_info(fname, info):
+            continue  # vision projector, not a launchable model — see _is_mmproj_info
         rows.append((fname, info))
 
     name_w = max([len(r[0]) for r in rows] + [10])
