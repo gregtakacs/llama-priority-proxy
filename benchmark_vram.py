@@ -172,12 +172,25 @@ def read_gguf_info(path):
 _SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 
 
+def _is_mmproj_file(fname):
+    """mmproj-*.gguf (vision projector) files are real GGUFs — read_gguf_info
+    parses them fine — but they're a companion to another model's --mmproj
+    flag (see config/model_options.json's extra_args), not a launchable model
+    in their own right. llama.cpp's own ecosystem convention is consistently
+    to put "mmproj" somewhere in the filename (mmproj-F16.gguf, mmproj-BF16.gguf,
+    <model>-mmproj-f16.gguf, ...), so filter on that rather than trying to
+    infer it from GGUF metadata."""
+    return "mmproj" in fname.lower()
+
+
 def discovered_model_names(models_dir):
     """Just the name-deriving pass of discover_models(), for building/refreshing
     a model_options.json without needing to read every GGUF's metadata twice."""
     names = []
     for fname in sorted(os.listdir(models_dir)):
         if not fname.lower().endswith(".gguf"):
+            continue
+        if _is_mmproj_file(fname):
             continue
         shard_match = _SHARD_RE.search(fname)
         if shard_match and shard_match.group(1) != "00001":
@@ -199,6 +212,8 @@ def discover_models(models_dir, options=None):
     for fname in sorted(os.listdir(models_dir)):
         if not fname.lower().endswith(".gguf"):
             continue
+        if _is_mmproj_file(fname):
+            continue  # vision projector, not a launchable model — see _is_mmproj_file
         shard_match = _SHARD_RE.search(fname)
         if shard_match and shard_match.group(1) != "00001":
             continue  # only the first shard is a load target; rest follow automatically
@@ -739,6 +754,8 @@ def cmd_inspect(args):
     for fname in sorted(os.listdir(args.models_dir)):
         if not fname.lower().endswith(".gguf"):
             continue
+        if _is_mmproj_file(fname):
+            continue  # vision projector, not a launchable model — see _is_mmproj_file
         shard_match = _SHARD_RE.search(fname)
         if shard_match and shard_match.group(1) != "00001":
             continue
