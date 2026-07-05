@@ -1199,7 +1199,7 @@ function renderModelsTable(models, containerId, cacheKey) {
         <td>${m.port}</td>
         <td>${fmtNum(m.ctx_size)}</td>
         <td class="proc-cell" data-port="${m.port}"><div class="proc-indicators">${indicators}<span class="proc-label">${procLabel}</span></div></td>
-        <td class="idle-cell">${m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—'}</td>
+        <td class="idle-cell" data-idle-s="${m.idle_for_s != null ? m.idle_for_s : ''}">${m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—'}</td>
       </tr>`;
     }
     html += '</tbody></table>';
@@ -1210,7 +1210,12 @@ function renderModelsTable(models, containerId, cacheKey) {
       const row = container.querySelector(`tr[data-model="${m.name}|${m.port}"]`);
       if (row) {
         const idleCell = row.querySelector('.idle-cell');
-        if (idleCell) idleCell.textContent = m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—';
+        if (idleCell) {
+          idleCell.dataset.idleS = m.idle_for_s != null ? m.idle_for_s : '';
+          if (!idleCell.classList.contains('is-active')) {
+            idleCell.textContent = m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—';
+          }
+        }
       }
     }
   }
@@ -1251,6 +1256,18 @@ function updateProcIndicators(port, active, total) {
     return `<div class="proc-dot${active[i] ? ' active' : ''}"></div>`;
   }).join('');
   procCell.innerHTML = `<div class="proc-indicators">${dots}<span class="proc-label">${running}/${slots}</span></div>`;
+
+  const idleCell = procCell.parentElement?.querySelector('.idle-cell');
+  if (idleCell) {
+    if (running > 0) {
+      idleCell.classList.add('is-active');
+      idleCell.textContent = 'active';
+    } else {
+      idleCell.classList.remove('is-active');
+      const raw = idleCell.dataset.idleS;
+      idleCell.textContent = (raw !== '' && raw != null) ? fmtIdle(parseFloat(raw)) : '—';
+    }
+  }
 }
 
 function renderScenariosList(scenarios) {
