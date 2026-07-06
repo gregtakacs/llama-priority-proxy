@@ -3,12 +3,12 @@
     {
       "name": "Qwen3.5-9B-UD-Q4_K_XL",
       "parallel_tested": 1,
-      "max_ctx": 262144,
+      "max_ctx": 32768,
       "base_vram_bytes": 7306477568,
       "bytes_per_ctx_token": 33792.0,
       "config_signature": {
         "parallel": 1,
-        "max_ctx": 262144,
+        "max_ctx": 32768,
         "min_ctx": null,
         "n_gpu_layers": 99,
         "extra_args": [
@@ -22,11 +22,11 @@
           "vram_bytes": 7444889600
         },
         {
-          "ctx": 262144,
-          "vram_bytes": 16164847616
+          "ctx": 32768,
+          "vram_bytes": 8413773824
         }
       ],
-      "measured_at": "2026-07-05T19:21:28"
+      "measured_at": "2026-07-05T19:48:55"
     },
     {
       "name": "Qwen3.6-35B-A3B-UD-Q4_K_XL",

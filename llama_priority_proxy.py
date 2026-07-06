@@ -268,6 +268,7 @@ class ProxyState:
         self.image_cfg = None            # parsed config/image_backend.json, or None if absent
         self.pre_comfy_scenario = None   # scenario active right before comfy_coexist took over
         self.comfy_revert_task = None    # single in-flight watch_comfy_queue_and_revert task, or None
+        self.comfy_activated_at = None   # monotonic timestamp of the most recent real comfy_coexist activation
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +342,7 @@ async def activate_comfy_coexist(state):
         return
     state.pre_comfy_scenario = state.active_scenario
     await activate_scenario(state, coexist_name, state.load_timeout_s)
+    state.comfy_activated_at = time.monotonic()
 
 
 async def free_comfyui_memory(state):
@@ -357,6 +359,49 @@ async def free_comfyui_memory(state):
         print(f"[proxy] WARNING: failed to free ComfyUI memory: {e}")
 
 
+async def comfy_queue_busy(state):
+    """True only if ComfyUI's own queue actually has something running/pending
+    RIGHT NOW. Used by watch_comfy_queue_and_revert to detect a natural,
+    patient drain (generation actually finished) — NOT used to decide whether
+    a competing request may forcibly preempt comfy_coexist early; see
+    scenario_fits_after_comfy_evict for that (a live VRAM check is the more
+    honest signal there, since queue state alone doesn't say whether ComfyUI
+    is still mid-load and about to claim more memory than it has yet).
+    Unreachable/unparseable ComfyUI reads as "not busy" — don't block
+    indefinitely on an unknown, same tolerant style as elsewhere here."""
+    cfg = state.image_cfg
+    try:
+        async with state.http_session.get(f"{cfg['base_url']}/queue",
+                                           timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            data = await resp.json()
+            return bool(data.get("queue_running") or data.get("queue_pending"))
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+        return False
+
+
+async def scenario_fits_after_comfy_evict(state, scenario_name):
+    """Empirical (live nvidia-smi) check for whether `scenario_name` could
+    actually load right now if the comfy_coexist model were evicted (or as-is
+    if it's already gone, e.g. crashed) — ground truth for "is it actually
+    safe to preempt comfy_coexist", rather than inferring it from an indirect
+    signal like ComfyUI's own queue state. Reuses solve_scenario_sizes, but
+    with a LIVE-measured budget instead of the static headroom-based one
+    activate_scenario itself uses for a normal switch: ComfyUI's real
+    footprint at any given moment isn't something this proxy predicts —
+    nvidia-smi already knows it exactly. state.loaded only ever holds
+    comfy_coexist's own member(s) while this scenario is active, so summing
+    all of it is exactly "what evicting comfy_coexist would free"."""
+    gpu_total = gpu_total_bytes(state.gpu_index)
+    gpu_used = gpu_used_bytes(state.gpu_index)
+    if gpu_used is None:
+        return True  # can't measure — don't block on an unknown
+    freed = sum(predicted_vram(state.registry[lm.name], lm.ctx_size) for lm in state.loaded.values())
+    available = gpu_total - gpu_used + freed - int(state.headroom_gb * (1024 ** 3))
+    sizes = solve_scenario_sizes(state.scenarios[scenario_name], state.registry, available)
+    total_needed = sum(predicted_vram(state.registry[name], ctx) for name, ctx in sizes.items())
+    return total_needed <= available and all(ctx > 0 for ctx in sizes.values())
+
+
 async def watch_comfy_queue_and_revert(state):
     """Started after every forwarded /prompt (see handle_comfyui_proxy), which
     cancels any previous instance first — only one of these runs at a time.
@@ -364,16 +409,10 @@ async def watch_comfy_queue_and_revert(state):
     back-to-back submissions, then frees ComfyUI and restores whatever
     scenario was active before comfy_coexist took over."""
     cfg = state.image_cfg
-    url = f"{cfg['base_url']}/queue"
     while True:
         await asyncio.sleep(cfg["queue_poll_interval_s"])
-        try:
-            async with state.http_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                data = await resp.json()
-                if not data.get("queue_running") and not data.get("queue_pending"):
-                    break
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
-            break  # can't tell — don't hold the coexistence model hostage indefinitely
+        if not await comfy_queue_busy(state):
+            break  # drained (or unreachable) — either way, don't hold the coexistence model hostage indefinitely
 
     await asyncio.sleep(cfg["revert_delay_s"])
     async with state.spawn_lock:
@@ -492,6 +531,15 @@ async def maybe_evict_idle_scenario(state):
         return
     if state.scenarios[state.active_scenario].get("default"):
         return  # already the baseline — nothing to revert to
+    if state.image_cfg is not None and state.active_scenario == state.image_cfg.get("coexist_scenario"):
+        # comfy_coexist has its own dedicated, ComfyUI-aware revert path (see
+        # watch_comfy_queue_and_revert) — the coexistence model looking idle
+        # from a CHAT perspective says nothing about whether ComfyUI itself
+        # is still mid-generation. Without this exemption, a long generation
+        # with no chat traffic in the meantime would get forcibly (and
+        # incorrectly) reverted here well before ComfyUI actually finishes —
+        # see the "5 minutes idle, comfy busy for 15" incident this guards.
+        return
     if not state.loaded:
         return  # nothing actually loaded for it yet
 
@@ -730,17 +778,28 @@ async def handle_completion(request):
                 # Nothing resident can cover it (or, for an image request, nothing
                 # resident that both covers it and can actually see) — normally
                 # "no cheaper option than switching", EXCEPT when comfy_coexist
-                # is active (see the check just below): ComfyUI is still
-                # holding its reserved VRAM chunk for the entire time that
-                # scenario is active, so a real switch here would evict the
-                # coexistence model for nothing — whatever we tried to load
-                # can't actually fit until ComfyUI itself releases that memory
-                # (i.e. until watch_comfy_queue_and_revert's own revert runs).
-            if (state.image_cfg is not None
-                    and state.active_scenario == state.image_cfg.get("coexist_scenario")):
-                return openai_error(503, f"Image generation is active and holding GPU memory — "
-                                          f"'{requested_label}' can't be loaded until it finishes.",
-                                     code="image_generation_busy")
+                # is active: preempting it isn't automatically safe, so decide
+                # with two checks instead of just assuming either way.
+            if state.image_cfg is not None and state.active_scenario == state.image_cfg.get("coexist_scenario"):
+                grace_s = state.image_cfg.get("startup_grace_s", 60)
+                within_grace = (state.comfy_activated_at is not None
+                                 and time.monotonic() - state.comfy_activated_at < grace_s)
+                # 1. Startup grace period: comfy_coexist may have JUST activated
+                #    and ComfyUI may still be mid-load — nvidia-smi's live
+                #    reading would understate its eventual footprint, so don't
+                #    even attempt a fit-check yet; assume busy unconditionally.
+                # 2. Otherwise, check empirically (live nvidia-smi, not an
+                #    inferred/stale signal) whether the requested scenario
+                #    would actually fit if the coexistence model were evicted
+                #    — see scenario_fits_after_comfy_evict's own docstring for
+                #    why this replaced trusting active_scenario alone (that
+                #    flag can outlive the coexistence model actually being
+                #    loaded, e.g. if it crashed, which previously left every
+                #    request stuck here forever with no path back to normal).
+                if within_grace or not await scenario_fits_after_comfy_evict(state, scenario_name):
+                    return openai_error(503, f"Image generation is active and holding GPU memory — "
+                                              f"'{requested_label}' can't be loaded until it finishes.",
+                                         code="image_generation_busy")
             await activate_scenario(state, scenario_name, state.load_timeout_s)
 
         lm = state.loaded.get(target["name"])

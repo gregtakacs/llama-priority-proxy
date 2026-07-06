@@ -61,7 +61,7 @@
       "min_p": 0,
       "repeat_penalty": 1.05,
       "presence_penalty": 1.0,
-      "max_ctx": 262144
+      "max_ctx": 32768
     },
     "Qwen3.6-35B-A3B-UD-Q4_K_XL": {
       "parallel": 4,
