@@ -690,8 +690,15 @@ _BENCH_OPTIONS_COMMENT = [
     "                             serve — it shifts the measured VRAM baseline and can't",
     "                             be corrected after the fact by `solve`.",
     "  min_ctx      (optional)    override the small ctx sample point used for the fit.",
-    "  max_ctx      (optional)    override the detected native context ceiling; also used",
-    "                             as the large sample point when min_ctx is set.",
+    "  max_ctx      (default: this model's own advertised native context length,",
+    "                             from its GGUF metadata — omitted if the GGUF doesn't",
+    "                             advertise one) hard cap on this model's context: also",
+    "                             the large sample point when min_ctx is set, AND the",
+    "                             ceiling `solve_scenario_sizes`'s \"auto\" ctx-sizing will",
+    "                             never exceed even with VRAM to spare. Lower it here (then",
+    "                             re-run `bench` — it's part of the config signature, so",
+    "                             this alone triggers an automatic re-measurement) if you",
+    "                             don't want a model ballooning to its full native ceiling.",
     "  extra_args   (optional)    extra llama-server flags (auto-set to [\"--embedding\"]",
     "                             for detected embedding models).",
     "  n_gpu_layers (default 99)  GPU offload layer count.",
@@ -726,18 +733,27 @@ _OPTIONS_METADATA_DEFAULTS = {
 }
 
 
-def write_options_file(path, names, embedding_names=None):
+def write_options_file(path, names, embedding_names=None, context_lengths=None):
     """Create or refresh model_options.json: add a default entry for any newly
     discovered model name, and backfill label/keep_alive onto EXISTING entries
     if either is missing — but never touch any value you've already set,
-    including a label/keep_alive you've already customized.
+    including a label/keep_alive (or max_ctx) you've already customized.
 
     `embedding_names`: names GGUF metadata says are embedding models (see
     read_gguf_info's is_embedding) — these get extra_args: ["--embedding"]
     backfilled too if not already set, since the live proxy only ever reads
     this file (never the GGUF itself) and has no other way to know a model
-    needs that flag to serve embeddings correctly."""
+    needs that flag to serve embeddings correctly.
+
+    `context_lengths`: name -> the GGUF's own advertised context_length (or
+    None/missing if that metadata wasn't present) — written as this model's
+    default max_ctx so the cap the proxy's "auto" ctx-sizing will respect is
+    visible and editable up front, rather than silently inherited from
+    discover_models()'s own `opt.get("max_ctx") or info["context_length"]`
+    fallback. Omitted entirely (not written as null) when the GGUF has no
+    advertised length to offer — nothing to default to."""
     embedding_names = embedding_names or set()
+    context_lengths = context_lengths or {}
     if os.path.exists(path):
         with open(path) as f:
             data = json.load(f)
@@ -749,6 +765,8 @@ def write_options_file(path, names, embedding_names=None):
     added = [name for name in names if name not in data["options"]]
     for name in added:
         entry = {"parallel": 1, "label": name, "keep_alive": ""}
+        if context_lengths.get(name) is not None:
+            entry["max_ctx"] = context_lengths[name]
         if name in embedding_names:
             entry["extra_args"] = ["--embedding"]
         data["options"][name] = entry
@@ -763,6 +781,9 @@ def write_options_file(path, names, embedding_names=None):
             if field not in entry:
                 entry[field] = name if field == "label" else default
                 changed = True
+        if "max_ctx" not in entry and context_lengths.get(name) is not None:
+            entry["max_ctx"] = context_lengths[name]
+            changed = True
         if "extra_args" not in entry and name in embedding_names:
             entry["extra_args"] = ["--embedding"]
             changed = True
@@ -818,18 +839,20 @@ def cmd_inspect(args):
     if args.write_options:
         names = discovered_model_names(args.models_dir)
         embedding_names = set()
+        context_lengths = {}
         for fname, info in rows:
-            if not info["is_embedding"]:
-                continue
             shard_match = _SHARD_RE.search(fname)
             name = fname[: shard_match.start()] if shard_match else fname[: -len(".gguf")]
-            embedding_names.add(name)
-        added, backfilled = write_options_file(args.write_options, names, embedding_names)
+            context_lengths[name] = info["context_length"]
+            if info["is_embedding"]:
+                embedding_names.add(name)
+        added, backfilled = write_options_file(args.write_options, names, embedding_names, context_lengths)
         if added:
             print(f"\nAdded {len(added)} new model(s) to '{args.write_options}' "
-                  f"(parallel: 1, label: <name>, keep_alive: blank): {', '.join(added)}")
+                  f"(parallel: 1, label: <name>, keep_alive: blank, "
+                  f"max_ctx: <advertised native ctx, if known>): {', '.join(added)}")
         if backfilled:
-            print(f"Backfilled missing label/keep_alive on {len(backfilled)} existing "
+            print(f"Backfilled missing label/keep_alive/max_ctx on {len(backfilled)} existing "
                   f"entry/entries: {', '.join(backfilled)}")
         if not added and not backfilled:
             print(f"\n'{args.write_options}' already covers every discovered model — nothing to do.")
@@ -880,6 +903,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    i = sub.add_parser("inspect", help="List *.gguf files with metadata-derived params/native context (no GPU needed)")
+    i.add_argument("--models-dir", required=True)
+    i.add_argument("--write-options", default=_default_config_path("model_options.json"),
+                   help="Create/refresh this model_options.json with a default {parallel: 1} entry "
+                        "for every discovered model — the recommended first step before `bench`. "
+                        "Existing entries are left untouched. (default: %(default)s)")
+    i.set_defaults(func=cmd_inspect)
+
     b = sub.add_parser("bench", help="Measure VRAM footprint of models via llama-server")
     b.add_argument("--models-dir", required=True, help="Auto-discover *.gguf files here (name/path/max_ctx all inferred)")
     b.add_argument("--options", default=_default_config_path("model_options.json"),
@@ -901,14 +932,6 @@ def main():
     b.add_argument("--image", default="llama-cpp-priority-proxy",
                    help="Docker image to run llama-server from (--backend docker only)")
     b.set_defaults(func=cmd_bench)
-
-    i = sub.add_parser("inspect", help="List *.gguf files with metadata-derived params/native context (no GPU needed)")
-    i.add_argument("--models-dir", required=True)
-    i.add_argument("--write-options", default=_default_config_path("model_options.json"),
-                   help="Create/refresh this model_options.json with a default {parallel: 1} entry "
-                        "for every discovered model — the recommended first step before `bench`. "
-                        "Existing entries are left untouched. (default: %(default)s)")
-    i.set_defaults(func=cmd_inspect)
 
     s = sub.add_parser("solve", help="Solve max ctx-size for a VRAM budget")
     s.add_argument("--registry", default=_default_config_path("model_vram_registry.json"))
