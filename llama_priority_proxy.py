@@ -291,6 +291,7 @@ class ProxyState:
         self.spawn_lock = asyncio.Lock()  # serialize scenario switches/spawns
         self.image_cfg = None            # parsed config/image_backend.json, or None if absent
         self.pre_comfy_scenario = None   # scenario active right before comfy_coexist took over
+        self.pre_comfy_last_used = {}    # model name -> last_used snapshot from right before that, see activate_comfy_coexist
         self.comfy_revert_task = None    # single in-flight watch_comfy_queue_and_revert task, or None
         self.comfy_activated_at = None   # monotonic timestamp of the most recent real comfy_coexist activation
 
@@ -390,11 +391,17 @@ async def activate_comfy_coexist(state):
     """No-op if already active. Remembers whatever was actually active so
     watch_comfy_queue_and_revert can restore it later instead of assuming
     "default" — a chat could've been happening in a non-default scenario when
-    the image request interrupted it."""
+    the image request interrupted it. Also snapshots each currently-loaded
+    model's last_used (state.loaded only ever holds the outgoing scenario's
+    own members at this point) so that restore can resume each one's idle
+    clock from where it actually was instead of granting a fresh full
+    keep_alive window just for having been caught in an unrelated image
+    generation — see restore_pre_comfy_state."""
     coexist_name = state.image_cfg["coexist_scenario"]
     if state.active_scenario == coexist_name:
         return
     state.pre_comfy_scenario = state.active_scenario
+    state.pre_comfy_last_used = {name: lm.last_used for name, lm in state.loaded.items()}
     await activate_scenario(state, coexist_name, state.load_timeout_s)
     state.comfy_activated_at = time.monotonic()
 
@@ -456,6 +463,73 @@ async def scenario_fits_after_comfy_evict(state, scenario_name):
     return total_needed <= available and all(ctx > 0 for ctx in sizes.values())
 
 
+def _pre_comfy_last_used_if_valid(state, name, now):
+    """Returns the pre-interruption last_used snapshot for `name` if it hasn't
+    already idled past its own keep_alive since being snapshotted, else None
+    (either it was never loaded before the interruption, or it's since expired).
+    Shared by scenario_has_restorable_members and restore_pre_comfy_state so
+    the two can't disagree about what still counts as "worth restoring"."""
+    saved_last_used = state.pre_comfy_last_used.get(name)
+    if saved_last_used is None:
+        return None
+    keep_alive = state.options.get(name, {}).get("keep_alive", "")
+    timeout = parse_keep_alive(keep_alive)
+    if timeout is not None and (now - saved_last_used) >= timeout:
+        return None
+    return saved_last_used
+
+
+def scenario_has_restorable_members(state, scenario_name):
+    """True if reactivating scenario_name would actually resume at least one
+    previously-resident model. False means every one of its members either
+    wasn't loaded before the interruption or has since idled out DURING it —
+    i.e. there's nothing left to resume, so reactivating it would just relabel
+    an empty shell (see watch_comfy_queue_and_revert, which falls back to the
+    default scenario instead when this is False)."""
+    now = time.monotonic()
+    return any(
+        _pre_comfy_last_used_if_valid(state, m["name"], now) is not None
+        for m in state.scenarios[scenario_name]["models"]
+    )
+
+
+async def restore_pre_comfy_state(state, scenario_name, load_timeout_s):
+    """Called right after activate_scenario reactivates the scenario comfy_coexist
+    interrupted. activate_scenario itself only lazily restores members that are
+    permanently pinned/eager (see eager_load_pinned_members) — everything else
+    would otherwise sit unloaded until the next real request, which is exactly
+    the "no warm-loading benefit at all" bug this fixes. For every member that
+    was ACTUALLY resident right before the interruption (state.pre_comfy_last_used,
+    snapshotted in activate_comfy_coexist) and hasn't since idled out, reload it
+    here and restore its last_used to that snapshot — so its idle-eviction clock
+    resumes from where it genuinely was instead of getting a fresh full
+    keep_alive window just for having been caught in an unrelated image
+    generation."""
+    scenario = state.scenarios[scenario_name]
+    now = time.monotonic()
+    for m in scenario["models"]:
+        name = m["name"]
+        saved_last_used = _pre_comfy_last_used_if_valid(state, name, now)
+        if saved_last_used is None:
+            continue
+        if name in state.loaded:
+            state.loaded[name].last_used = saved_last_used
+            continue
+        port = scenario["port"] if m.get("slot", "primary") == "primary" else scenario["port_secondary"]
+        ctx = state.reserved_ctx[name]
+        try:
+            lm = await spawn_model(state, name, port, ctx, load_timeout_s)
+            lm.last_used = saved_last_used
+            state.loaded[name] = lm
+            keep_alive = state.options.get(name, {}).get("keep_alive", "")
+            timeout = parse_keep_alive(keep_alive)
+            remaining = f"{timeout - (now - saved_last_used):.0f}s left on its keep_alive" if timeout is not None else "no keep_alive limit"
+            print(f"[proxy] restored '{name}' for scenario '{scenario_name}' ({remaining})")
+        except RuntimeError as e:
+            print(f"[proxy] WARNING: failed to restore model '{name}': {e}")
+    state.pre_comfy_last_used = {}
+
+
 async def watch_comfy_queue_and_revert(state):
     """Started after every forwarded /prompt (see handle_comfyui_proxy), which
     cancels any previous instance first — only one of these runs at a time.
@@ -474,9 +548,22 @@ async def watch_comfy_queue_and_revert(state):
             return  # already legitimately preempted by something else (e.g. a vision request)
         # activate_scenario's own hook frees ComfyUI's memory as part of
         # leaving comfy_coexist — no need to duplicate that call here.
-        target = state.pre_comfy_scenario or next(name for name, s in state.scenarios.items() if s.get("default"))
+        default_name = next(name for name, s in state.scenarios.items() if s.get("default"))
+        target = state.pre_comfy_scenario or default_name
+        if target != default_name and not scenario_has_restorable_members(state, target):
+            # Everything pre_comfy_scenario had running idled out DURING the
+            # interruption itself (image generation can run well past a short
+            # scenario's own keep_alive) -- reactivating it would just relabel
+            # an empty shell with nothing loaded and no path back to default
+            # until a real request forces a switch (see maybe_evict_idle_scenario's
+            # own "if not state.loaded: return" guard, which can't help here since
+            # it never fires for an already-empty scenario). Equivalent to there
+            # having been no prior scenario at all: go straight to default.
+            print(f"[proxy] '{target}' fully idled out during image generation — reverting to default '{default_name}' instead")
+            target = default_name
         print(f"[proxy] ComfyUI queue drained — reverting to '{target}'")
         await activate_scenario(state, target, state.load_timeout_s)
+        await restore_pre_comfy_state(state, target, state.load_timeout_s)
 
 
 async def activate_scenario(state, scenario_name, load_timeout_s):
@@ -595,9 +682,19 @@ async def maybe_evict_idle_scenario(state):
         # incorrectly) reverted here well before ComfyUI actually finishes —
         # see the "5 minutes idle, comfy busy for 15" incident this guards.
         return
-    if not state.loaded:
-        return  # nothing actually loaded for it yet
-
+    # No "if not state.loaded: return" guard here on purpose: every path that
+    # calls activate_scenario (and its internal eager-loading) does so while
+    # holding state.spawn_lock, and this function is only ever reached via
+    # idle_eviction_sweep, which needs that same lock first -- so there's no
+    # window where a scenario switch is "still starting up" when this runs.
+    # An empty state.loaded here means every member died individually (e.g.
+    # the ClientConnectorError crash-recovery path in handle_completion, which
+    # pops a dead model without touching active_scenario) while this scenario
+    # was still nominally active. Treating that as "not idle yet" left the
+    # proxy stuck showing an active-but-empty scenario forever, with no path
+    # back to default until some unrelated request happened to force a real
+    # switch. The loop below already does the right thing on an empty dict —
+    # it just never runs, and falls through to reverting to default.
     now = time.monotonic()
     for lm in state.loaded.values():
         timeout = parse_keep_alive(lm.keep_alive)
