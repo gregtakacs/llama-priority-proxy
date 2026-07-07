@@ -51,6 +51,7 @@ DEFAULT_LOAD_TIMEOUT_S = 300
 DEFAULT_MAX_WAIT_S = 60
 DEFAULT_KEEP_ALIVE_S = 300  # Ollama's own default idle timeout, used for blank/unset keep_alive
 IDLE_SWEEP_INTERVAL_S = 10
+DEFAULT_EVICT_DRAIN_TIMEOUT_S = 40  # see drain_in_flight_before_evict -- ~8k tokens at 200 tok/s
 
 _KEEP_ALIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)(s|m|h)$")
 _KEEP_ALIVE_UNITS = {"s": 1, "m": 60, "h": 3600}
@@ -101,6 +102,16 @@ def openai_error(status, message, err_type="invalid_request_error", code=None):
         {"error": {"message": message, "type": err_type, "param": None, "code": code}},
         status=status,
     )
+
+
+def preempted_error(requested_label):
+    """Specific, friendly error for a request whose model was killed by
+    drain_in_flight_before_evict's forced-eviction path (see LoadedModel.
+    preempted_reason) — distinct from the generic "model crashed" error so
+    the caller (and, ultimately, the chat UI) can tell "the GPU was needed
+    for image generation, just retry" apart from an actual backend failure."""
+    return openai_error(503, f"'{requested_label}' was interrupted because image generation needed the GPU. "
+                              f"Please retry your message.", code="image_generation_preempted")
 
 
 @web.middleware
@@ -250,6 +261,19 @@ class LoadedModel:
         self.keep_alive = keep_alive
         self.parallel = parallel
         self.last_used = time.monotonic()
+        # Count of forward() calls currently using this model, so
+        # activate_scenario's eviction loop (see drain_in_flight_before_evict)
+        # can wait for them to finish instead of killing the process out from
+        # under a live request/stream.
+        self.in_flight = 0
+        # Set by drain_in_flight_before_evict when this exact model gets
+        # force-evicted with requests still in flight (drain timeout
+        # exceeded). The in-flight request's own exception handler in
+        # handle_completion checks this (via its already-held `lm`/`alias`
+        # reference, which still points at this same object after eviction)
+        # to return a specific, friendly error instead of a generic
+        # "model crashed" one.
+        self.preempted_reason = None
 
 
 class ProxyState:
@@ -321,6 +345,36 @@ async def spawn_model(state, name, port, ctx, load_timeout_s):
 async def evict_model(lm):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, shutdown_server, lm.handle)
+
+
+async def drain_in_flight_before_evict(lm, name, timeout_s, poll_interval_s=0.2):
+    """Wait for any forward() calls currently using `lm` to finish before it
+    gets evicted. forward() deliberately runs WITHOUT holding state.spawn_lock
+    (a long chat stream can't hold the lock for its whole duration — see
+    handle_completion), which means activate_scenario's eviction loop (which
+    DOES hold the lock) previously had zero visibility into whether the model
+    it was about to kill was mid-request. In practice this model is very
+    often the exact one an image-generation tool call's own conversation
+    turn is using (or a concurrent title/tags/follow-up background call to
+    the same model) — evicting out from under it doesn't fail cleanly, it
+    kills the connection with a raw disconnect (ServerDisconnectedError /
+    ClientConnectionResetError), silently losing that turn's response even
+    though the image generation itself goes on to succeed independently.
+    Bounded: comfy_coexist genuinely needs the VRAM and can't wait forever,
+    so if requests are still in flight after timeout_s, evict anyway with a
+    loud warning rather than block image generation indefinitely -- but flag
+    `lm` first so the request(s) still in flight get a clean, specific error
+    (see handle_completion's ClientConnectorError/ClientConnectionError
+    handlers) instead of an opaque raw disconnect."""
+    if lm.in_flight <= 0:
+        return
+    deadline = time.monotonic() + timeout_s
+    while lm.in_flight > 0 and time.monotonic() < deadline:
+        await asyncio.sleep(poll_interval_s)
+    if lm.in_flight > 0:
+        print(f"[proxy] WARNING: evicting '{name}' with {lm.in_flight} request(s) still in flight "
+              f"after waiting {timeout_s}s for them to drain — proceeding anyway, this will disconnect them")
+        lm.preempted_reason = "image_generation"
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +510,7 @@ async def activate_scenario(state, scenario_name, load_timeout_s):
     for name, lm in list(state.loaded.items()):
         if name in new_names and lm.ctx_size == new_sizes.get(name):
             continue  # shared with the new scenario at the same size — keep it running
+        await drain_in_flight_before_evict(lm, name, state.evict_drain_timeout_s)
         print(f"[proxy] activate_scenario('{scenario_name}'): evicting '{name}' (not in new scenario, or ctx-size mismatch)")
         await evict_model(lm)
         del state.loaded[name]
@@ -814,6 +869,13 @@ async def handle_completion(request):
                 return openai_error(503, str(e))
             state.loaded[target["name"]] = lm
 
+    # in_flight is read by activate_scenario (via drain_in_flight_before_evict)
+    # to avoid killing this model out from under this exact request — spawn_lock
+    # is deliberately NOT held across forward() (a long chat stream can't hold
+    # it for its whole duration), so this counter is the only thing standing
+    # between a concurrent scenario switch (e.g. an image-generation tool call
+    # activating comfy_coexist) and evicting a perfectly healthy, in-flight model.
+    lm.in_flight += 1
     try:
         result = await forward(request, state, body, lm.port, requested_label, target["name"], state.max_wait_s)
         lm.last_used = time.monotonic()  # on completion, not dispatch — "idle" should mean actually idle
@@ -832,6 +894,8 @@ async def handle_completion(request):
             stale = state.loaded.pop(target["name"], None)
             if stale is not None:
                 await evict_model(stale)
+        if lm.preempted_reason == "image_generation":
+            return preempted_error(requested_label)
         return openai_error(503, f"Model '{requested_label}' is not responding (it may have crashed) — "
                                   f"it will reload on the next request.", code="model_unavailable")
     except aiohttp.ClientConnectionError as e:
@@ -843,8 +907,15 @@ async def handle_completion(request):
         # unhealthy at all. Treating this as a crash was the actual cause of
         # the "model loads then immediately unloads" incident — the model
         # got killed once per keystroke for no real reason. Don't evict.
+        # BUT: if drain_in_flight_before_evict already flagged this exact
+        # model as force-evicted for image generation, that's not a spurious
+        # client-side cancel -- return the specific, actionable error instead.
         print(f"[proxy] '{target['name']}' request failed after {type(e).__name__}: {e} (not evicting)")
+        if lm.preempted_reason == "image_generation":
+            return preempted_error(requested_label)
         return openai_error(503, f"Request to '{requested_label}' failed: {e}", code="request_failed")
+    finally:
+        lm.in_flight -= 1
 
 
 async def handle_status(request):
@@ -1907,6 +1978,11 @@ def main():
                          default=int(os.environ.get("PROXY_MAX_WAIT_S", str(DEFAULT_MAX_WAIT_S))),
                          help="Max seconds to wait for a free slot before returning a real error "
                               "(one global setting for all connections, per the design discussion).")
+    parser.add_argument("--evict-drain-timeout", type=int,
+                         default=int(os.environ.get("PROXY_EVICT_DRAIN_TIMEOUT_S", str(DEFAULT_EVICT_DRAIN_TIMEOUT_S))),
+                         help="Max seconds an automatic scenario switch (e.g. comfy_coexist activating) "
+                              "will wait for in-flight requests on the model being evicted to finish "
+                              "before killing it anyway.")
     args = parser.parse_args()
 
     state = ProxyState()
@@ -1915,6 +1991,7 @@ def main():
     state.headroom_gb = args.headroom_gb
     state.load_timeout_s = args.load_timeout
     state.max_wait_s = args.max_wait
+    state.evict_drain_timeout_s = args.evict_drain_timeout
     state.options, state.registry, state.standalone, state.scenarios, state.image_cfg = load_config(args.config_dir)
     state.label_index = build_label_index(state.scenarios, state.standalone, state.options)
 
