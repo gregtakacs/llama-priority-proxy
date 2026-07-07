@@ -2,6 +2,8 @@
 
 An OpenAI-compatible request routing proxy for [llama.cpp](https://github.com/ggml-org/llama.cpp) that sits in front of multiple `llama-server` child processes, managing VRAM-aware model loading, priority-based scenario switching, capacity queuing, and idle eviction — all through a single port.
 
+In practice, this makes it possible to host a multi-model, multi-user, multi-use-case (chat, coding, and image generation via the ComfyUI coexistence feature) Open WebUI setup on a single GPU with as little as 16–32GB of VRAM — with each model's context size maximized against actual available VRAM instead of a conservative guess, and true parallel request handling (via llama.cpp's own `--parallel` slots) even for models Ollama doesn't support running in parallel at all.
+
 ## Features
 
 - **Priority-based scenario switching** — Define named groups of models (scenarios) with priorities. Requests are routed to the right scenario; lower-priority ones are preempted.
@@ -9,7 +11,7 @@ An OpenAI-compatible request routing proxy for [llama.cpp](https://github.com/gg
 - **Capacity queuing** — When a model's slots are full, requests queue with SSE heartbeat keep-alive instead of failing immediately.
 - **Idle eviction** — Non-default scenarios automatically revert to the default scenario after their keep_alive timeout.
 - **Fallback model aliasing** — Tag a resident model to cover another scenario's role, avoiding unnecessary switches.
-- **Eager-load pinned models** — Mark a model with `keep_alive: -1` to load it immediately when its scenario activates.
+- **Eager-loading** — Mark a scenario member `"eager": true` to load it the instant its scenario activates, instead of waiting for the first request. (`keep_alive: -1` gets the same effect too, but only as a side effect of what it actually means — "never idle-evict this model" — not because `-1` itself means "eager"; use the explicit flag if eager-loading is the actual goal.)
 - **OpenAI-compatible API** — Works with any OpenAI-compatible client (Open WebUI, etc.) via `/v1/chat/completions`, `/v1/embeddings`, etc.
 - **Multimodal (vision) support** — Models launched with `--mmproj` accept image input; image requests are kept off resident models/aliases that lack it instead of failing with an opaque backend error.
 - **Live status dashboard** — A built-in web UI at `/dashboard` showing active scenario, loaded models, per-slot activity, and GPU VRAM, with a control to manually switch scenarios.
@@ -27,6 +29,7 @@ Client → :11444 (this proxy)
              ├── /scenarios/{name}/activate →  manually force a scenario switch
              ├── /models/{name}/load, /evict →  manually force-load/evict a model in the active scenario
              ├── /slots/{port}          →  same-origin proxy to a child's /slots (dashboard use)
+             ├── /comfyui/{tail:.*}     →  reverse-proxy to ComfyUI, if configured (see Image Generation Coexistence)
              ├── /dashboard, /          →  status dashboard (HTML/JS, no auth — see Authentication)
              └── /health                →  health check (no auth required)
 ```
@@ -55,6 +58,7 @@ The `config/` directory contains all routing and model configuration. **Several 
 | `model_vram_registry.json` | `bench` | Per-model VRAM baselines from benchmarking |
 | `scenario_*.json` | Manual | Named model groups with priority, default model, ports, fallback aliases |
 | `standalone_models.json` | Manual | Models always resident outside the scenario system (e.g., embeddings) |
+| `image_backend.json` | Manual, optional | Enables ComfyUI reverse-proxying + VRAM coexistence — see [Image Generation Coexistence](#image-generation-coexistence-comfyui). Omit this file to disable the feature entirely. |
 
 ### How to Generate Config Files
 
@@ -122,6 +126,8 @@ The `config/` directory contains all routing and model configuration. **Several 
      ]
    }
    ```
+
+   > **A scenario supports at most two concurrently-loaded models right now** — one `"slot": "primary"` (bound to `port`) and one other slot (bound to `port_secondary`). This covers the common case well, e.g. a "coding" scenario with a full coding-agent model as primary and a small, fast code-completion model as secondary — but it's a real ceiling in the current port-assignment logic, not a soft default: a third model in the same scenario would collide with the secondary one on the same port. If a use case ever needs more than two resident models in one scenario, that's a code change (e.g. per-model explicit ports), not a config one — we'll reconsider it if it comes up.
 
 5. **Create `config/standalone_models.json`** for models that should always be loaded (e.g., embeddings):
    ```json
@@ -219,6 +225,7 @@ python llama_priority_proxy.py --models-dir /path/to/models --config-dir config 
 | `--headroom-gb` | `1.0` | GB of VRAM to reserve as headroom |
 | `--load-timeout` | `300` | Seconds to wait for a model to become healthy |
 | `--max-wait` | `60` | Max seconds to wait for a free slot before returning an error |
+| `--evict-drain-timeout` | `40` | Max seconds an automatic scenario switch (e.g. ComfyUI coexistence activating — see below) waits for in-flight requests on the model being evicted to finish before killing it anyway |
 
 **Environment variables** (override CLI defaults):
 
@@ -229,6 +236,7 @@ python llama_priority_proxy.py --models-dir /path/to/models --config-dir config 
 | `PROXY_HEADROOM_GB` | `1.0` | VRAM headroom in GB |
 | `PROXY_LOAD_TIMEOUT_S` | `300` | Model load timeout in seconds |
 | `PROXY_MAX_WAIT_S` | `60` | Max wait time for a free slot |
+| `PROXY_EVICT_DRAIN_TIMEOUT_S` | `40` | Max seconds to wait for in-flight requests to drain before a forced eviction |
 
 ## API Endpoints
 
@@ -243,6 +251,7 @@ python llama_priority_proxy.py --models-dir /path/to/models --config-dir config 
 | `/models/{name}/load` | POST | Yes | Force-load a model belonging to the active scenario (no-op if already loaded — see Dashboard) |
 | `/models/{name}/evict` | POST | Yes | Force-evict a currently loaded model (no-op if not loaded — see Dashboard) |
 | `/slots/{port}` | GET | Yes | Same-origin proxy to a child's own `/slots` (used by the dashboard) |
+| `/comfyui/{tail:.*}` | Any | Yes | Reverse-proxies to ComfyUI — only present if `image_backend.json` exists (503 otherwise). See [Image Generation Coexistence](#image-generation-coexistence-comfyui). |
 | `/dashboard`, `/` | GET | No | Status dashboard shell (HTML/JS only — see Authentication) |
 | `/health` | GET | No | Health check (Docker HEALTHCHECK) |
 
@@ -257,9 +266,61 @@ Authorization: Bearer <your-api-key>
 
 > **If `PROXY_API_KEY` is left unset, authentication is not "reduced" — it is off entirely, for every route, not just the dashboard.** `auth_middleware` only enforces the check `if api_key and ...`; an empty/unset key is falsy, so the whole condition short-circuits and every request skips the check, including `/v1/chat/completions` and the scenario-switch endpoint. Running without a key is only safe if the proxy is reachable exclusively from a fully trusted network — remember it binds `0.0.0.0` (and typically `network_mode: host` in the Docker Compose example), so anything else on that network can reach it too.
 
+## Image Generation Coexistence (ComfyUI)
+
+If a GPU is shared between chat/coding models and an image generation backend (e.g. [ComfyUI](https://github.com/comfyanonymous/ComfyUI)), a naive setup either wastes VRAM keeping both fully resident, or thrashes constantly evicting one for the other. This feature lets the proxy actively manage that handoff: reverse-proxy image generation requests through itself, evict just enough chat capacity the instant one arrives, and restore what was running before once it's done — entirely optional and off unless configured.
+
+**Enable it** by creating `config/image_backend.json`:
+
+```json
+{
+  "base_url": "http://127.0.0.1:8188",
+  "coexist_scenario": "comfy_coexist",
+  "queue_poll_interval_s": 2,
+  "revert_delay_s": 5,
+  "startup_grace_s": 60
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `base_url` | ComfyUI's own API, reachable from this proxy's container/host |
+| `coexist_scenario` | Name of the scenario (see below) activated the moment generation starts |
+| `queue_poll_interval_s` | How often to poll ComfyUI's queue while waiting for it to drain |
+| `revert_delay_s` | Settle window after the queue drains, before reverting, to absorb back-to-back submissions |
+| `startup_grace_s` | Grace period after activation during which a competing request can't preempt it — ComfyUI may still be mid-load, so a live VRAM read would understate its eventual footprint |
+
+Deleting this file disables the feature entirely — `/comfyui/*` routes then return a 503.
+
+**Define the coexistence scenario itself** like any other scenario (see Configuration above), typically a small model that keeps some chat capability alive alongside ComfyUI. This is the actual point of the whole feature in a multi-user setting: without it, one user generating an image would leave every *other* user's chat with nothing resident to answer from — the small coexistence model gives them a warm, fast-responding model to fall back on for the duration, instead of a hard block or a cold-load wait behind the image generation:
+
+```json
+{
+  "name": "comfy_coexist",
+  "priority": 100,
+  "default": false,
+  "port": 11446,
+  "comfy_reserved_vram_bytes": 22548578304,
+  "models": [
+    {"name": "Qwen3.5-9B-UD-Q4_K_XL", "ctx": "auto", "slot": "primary",
+     "label": "comfy-coexist", "eager": true, "fallback_for": ["chat", "coding"]}
+  ]
+}
+```
+
+`priority` should outrank every scenario in `fallback_for` (otherwise a competing request skips the fallback and forces a disruptive real switch instead), `eager: true` loads this model the instant the scenario activates rather than waiting for a request, and `comfy_reserved_vram_bytes` caps how large this scenario's own model is allowed to grow so it doesn't starve ComfyUI's real VRAM need.
+
+**How it behaves:**
+
+1. A client `POST`s to `/comfyui/prompt`. The proxy activates `coexist_scenario` first — freeing VRAM before ComfyUI ever starts loading a checkpoint — then forwards the request through to ComfyUI.
+2. Evicting whatever was active doesn't just kill it out from under a live request: the proxy waits up to `--evict-drain-timeout`/`PROXY_EVICT_DRAIN_TIMEOUT_S` (default 40s) for in-flight requests on that model to finish first. If one is still running when the timeout expires, it's evicted anyway (image generation can't wait forever), but that specific request gets a clear `image_generation_preempted` error instead of a raw disconnect.
+3. Once ComfyUI's queue drains (polled every `queue_poll_interval_s`) and `revert_delay_s` has passed, the proxy reverts to whatever scenario was active before the interruption — restoring the models that were actually resident, not just relabeling the scenario name, and resuming each one's idle-eviction clock from where it genuinely was (not a fresh full window, which would otherwise let an interrupted-but-nearly-idle session linger far longer than it would have on its own).
+4. If everything the interrupted scenario had running idled out *during* the interruption itself (a long generation can outlast a short scenario's own `keep_alive`), there's nothing left worth restoring — the proxy falls through to the default scenario instead of reactivating an empty shell with nothing loaded.
+5. A higher-or-equal-priority request can still preempt the coexistence scenario early if the GPU genuinely has room for both (checked live via `nvidia-smi`, not inferred) — except during `startup_grace_s`, when ComfyUI may still be mid-load and a live VRAM reading would be misleadingly optimistic.
+
 ## Dashboard
 
-A single-page status dashboard is served at `/dashboard` (`/` serves the identical page directly, not a redirect) — no separate build step or static files, the HTML/JS is embedded directly in `llama_priority_proxy.py`.
+A single-page status dashboard is served at `/dashboard` (`/` serves the identical page directly, not a redirect) — no separate build step; the HTML/JS lives in its own `dashboard.html`, read once at proxy startup and served as-is (no templating).
 
 **What it shows:**
 - Active scenario, its priority, and how many of its models are currently loaded
@@ -272,9 +333,9 @@ A single-page status dashboard is served at `/dashboard` (`/` serves the identic
 
 **Manual model load/evict:** each row in the active scenario's model table has a Load or Evict button, backed by `POST /models/{name}/load` and `POST /models/{name}/evict`. These only work for members of the *currently active* scenario (that's what determines which port and reserved context size to launch on) and are idempotent — loading an already-loaded model or evicting an already-absent one is a no-op. A force-evicted model stays absent until the next scenario activation (or another force-load) brings it back, even if it's `keep_alive: -1` pinned.
 
-**Auth flow:** the dashboard page itself loads with no key (see Authentication above), then shows a login gate prompting for the same `PROXY_API_KEY` used everywhere else. The key is kept in `sessionStorage` for that browser tab only — never `localStorage`, never sent anywhere but back to this same proxy as a Bearer header. A wrong key or a `401` mid-session (e.g. the key changed) clears the stored value and re-shows the login gate. There's a logout button that clears it manually.
+**Auth flow:** the dashboard page itself loads with no key (see Authentication above). On load, it tries an anonymous `/status` call before ever prompting for anything; if that succeeds, it goes straight to the dashboard — no login gate at all. Only if that anonymous call actually fails does it fall back to a login gate prompting for the same `PROXY_API_KEY` used everywhere else. The key is kept in `sessionStorage` for that browser tab only — never `localStorage`, never sent anywhere but back to this same proxy as a Bearer header. A wrong key or a `401` mid-session (e.g. the key changed) clears the stored value and re-shows the login gate. There's a logout button that clears it manually.
 
-If `PROXY_API_KEY` is unset, the dashboard's login gate still appears, but any key (or none) will work against `/status`/`/slots` since auth is off entirely in that mode (see the warning above).
+If `PROXY_API_KEY` is unset, the login gate never appears at all: the anonymous `/status` call always succeeds since auth is off entirely in that mode (see the warning above), so the dashboard just loads straight in.
 
 ## Project Structure
 
@@ -283,6 +344,7 @@ llama-priority-proxy/
 ├── llama_priority_proxy.py   # Main proxy entrypoint
 ├── llama_process.py           # llama-server process management
 ├── benchmark_vram.py          # VRAM benchmarking utility
+├── dashboard.html              # Dashboard UI (served at /dashboard, read at startup)
 ├── Dockerfile.llama-cpp-priority-proxy
 ├── requirements.txt           # Python dependencies (aiohttp)
 ├── config/
@@ -290,7 +352,8 @@ llama-priority-proxy/
 │   ├── model_vram_registry.json    # Auto-generated by benchmark
 │   ├── scenario_chat.json          # Manual — scenario definitions
 │   ├── scenario_coding.json        # Manual — scenario definitions
-│   └── standalone_models.json      # Manual — always-on models
+│   ├── standalone_models.json      # Manual — always-on models
+│   └── image_backend.json          # Manual, optional — ComfyUI coexistence (see above)
 ├── test-scripts/                   # Development/test utilities
 ├── examples/                       # Docker Compose and config templates
 ├── LICENSE                         # Apache License 2.0
