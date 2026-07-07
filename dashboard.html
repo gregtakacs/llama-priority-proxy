@@ -183,6 +183,7 @@
       <div class="card-title">Active Scenario</div>
       <div class="scenario-name" id="activeScenario">—</div>
       <div class="scenario-meta" id="scenarioMeta"></div>
+      <div class="scenario-meta" id="comfyRevertMeta" style="display:none;"></div>
     </div>
 
     <div class="card">
@@ -315,10 +316,20 @@ async function apiFetch(path) {
 
 // ---- Polling ----
 let pollTimer = null;
+// A single failed poll is very often just a transient blip in front of a
+// reverse proxy (Traefik briefly not routing during a backend restart, a
+// dropped connection, etc.) rather than the backend actually being down --
+// surfacing "Disconnected" + a raw HTTP/network error for that would be
+// alarming noise the next successful poll immediately contradicts. Only
+// flip to the disconnected state (and show the error) after a couple of
+// consecutive failures; a lone blip just quietly retries next cycle.
+let consecutiveFailures = 0;
+const DISCONNECTED_THRESHOLD = 2;
 
 async function fetchAndRender() {
   try {
     const status = await apiFetch('/status');
+    consecutiveFailures = 0;
     showStatusOk('Connected');
     hideError();
     // Show main content on first success
@@ -326,8 +337,11 @@ async function fetchAndRender() {
     document.getElementById('emptyState').style.display = 'none';
     renderStatus(status);
   } catch(e) {
-    showStatusErr('Disconnected');
-    showError(e.message);
+    consecutiveFailures++;
+    if (consecutiveFailures >= DISCONNECTED_THRESHOLD) {
+      showStatusErr('Disconnected');
+      showError(e.message);
+    }
   }
   document.getElementById('refreshInfo').textContent = `Refresh: ${getRefreshRateSeconds()}s`;
 }
@@ -420,6 +434,20 @@ function renderStatus(data) {
   }
   metaParts.push(`${loadedCount}/${scenarioModels.length} model${scenarioModels.length !== 1 ? 's' : ''} loaded`);
   document.getElementById('scenarioMeta').textContent = metaParts.join(' · ');
+
+  const comfyEl = document.getElementById('comfyRevertMeta');
+  if (data.image_backend?.active) {
+    comfyEl.style.display = '';
+    if (data.image_backend.revert_in_s == null) {
+      comfyEl.textContent = '🖼 Image generating — revert timer starts once ComfyUI\'s queue drains';
+    } else if (data.image_backend.revert_in_s <= 0) {
+      comfyEl.textContent = '🖼 Reverting…';
+    } else {
+      comfyEl.textContent = `🖼 Queue drained — reverting to '${data.image_backend.pre_comfy_scenario || 'default'}' in ${fmtIdle(data.image_backend.revert_in_s)} (of ${fmtIdle(data.image_backend.revert_delay_s)})`;
+    }
+  } else {
+    comfyEl.style.display = 'none';
+  }
 
   document.getElementById('lastUpdate').textContent = `Last update: ${new Date().toLocaleTimeString()}`;
 
@@ -705,15 +733,33 @@ document.getElementById('scenariosList').addEventListener('click', (e) => {
 
 document.getElementById('switchModalCancel').addEventListener('click', closeSwitchModal);
 
+// A scenario switch can legitimately take up to load_timeout_s (model spawn)
+// server-side, which can outlast an intermediate hop's own timeout (a
+// reverse proxy, a flaky connection) -- the browser's fetch() then rejects
+// with "Failed to fetch" even though the backend went on to complete the
+// switch anyway. Poll real state before believing that failure; a switch
+// that actually landed shouldn't leave the modal stuck showing an error.
+async function confirmScenarioActive(name, attempts = 5, delayMs = 2000) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const status = await apiFetch('/status');
+      if (status.active_scenario === name) return true;
+    } catch (_) { /* keep trying — this is exactly the kind of blip we're working around */ }
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+  return false;
+}
+
 document.getElementById('switchModalConfirm').addEventListener('click', async () => {
   if (!pendingScenario) return;
+  const targetScenario = pendingScenario;
   const btn = document.getElementById('switchModalConfirm');
   const errEl = document.getElementById('switchModalError');
   btn.disabled = true;
   btn.textContent = 'Switching… (can take up to a minute)';
   errEl.classList.add('hidden');
   try {
-    const resp = await fetch(`/scenarios/${encodeURIComponent(pendingScenario)}/activate`,
+    const resp = await fetch(`/scenarios/${encodeURIComponent(targetScenario)}/activate`,
                               { method: 'POST', headers: authHeaders() });
     if (resp.status === 401) {
       clearStoredKey();
@@ -728,6 +774,12 @@ document.getElementById('switchModalConfirm').addEventListener('click', async ()
     closeSwitchModal();
     await fetchAndRender();
   } catch (e) {
+    btn.textContent = 'Checking whether it switched anyway…';
+    if (await confirmScenarioActive(targetScenario)) {
+      closeSwitchModal();
+      await fetchAndRender();
+      return;
+    }
     errEl.textContent = e.message;
     errEl.classList.remove('hidden');
     btn.disabled = false;

@@ -294,6 +294,9 @@ class ProxyState:
         self.pre_comfy_last_used = {}    # model name -> last_used snapshot from right before that, see activate_comfy_coexist
         self.comfy_revert_task = None    # single in-flight watch_comfy_queue_and_revert task, or None
         self.comfy_activated_at = None   # monotonic timestamp of the most recent real comfy_coexist activation
+        self.comfy_queue_drained_at = None  # monotonic timestamp ComfyUI's queue last went empty, or None
+                                             # while still generating (or before the first /prompt) — see
+                                             # watch_comfy_queue_and_revert and handle_status's revert_in_s
 
 
 # ---------------------------------------------------------------------------
@@ -537,11 +540,13 @@ async def watch_comfy_queue_and_revert(state):
     back-to-back submissions, then frees ComfyUI and restores whatever
     scenario was active before comfy_coexist took over."""
     cfg = state.image_cfg
+    state.comfy_queue_drained_at = None  # still generating — see handle_status's revert_in_s
     while True:
         await asyncio.sleep(cfg["queue_poll_interval_s"])
         if not await comfy_queue_busy(state):
             break  # drained (or unreachable) — either way, don't hold the coexistence model hostage indefinitely
 
+    state.comfy_queue_drained_at = time.monotonic()
     await asyncio.sleep(cfg["revert_delay_s"])
     async with state.spawn_lock:
         if state.active_scenario != cfg["coexist_scenario"]:
@@ -895,6 +900,7 @@ async def handle_completion(request):
             return openai_error(503, f"Request to '{requested_label}' failed: {e}", code="request_failed")
 
     scenario_name = target["scenario"]
+    alias = None
     async with state.spawn_lock:
         if state.active_scenario != scenario_name:
             active_priority = (state.scenarios[state.active_scenario]["priority"]
@@ -903,68 +909,103 @@ async def handle_completion(request):
             if not outranks_active:
                 alias = find_fallback(state, scenario_name, require_vision=has_image)
                 if alias is not None:
-                    try:
-                        result = await forward(request, state, body, alias.port, requested_label, alias.name, state.max_wait_s)
-                        alias.last_used = time.monotonic()
-                        return result
-                    except asyncio.CancelledError:
-                        print(f"[proxy] request for '{alias.name}' (fallback alias) cancelled (client disconnected?) — not evicting")
-                        raise
-                    except aiohttp.ClientConnectorError as e:
-                        print(f"[proxy] '{alias.name}' (fallback alias) evicted after {type(e).__name__}: {e}")
-                        # Already holding spawn_lock here — mutate directly, don't re-acquire.
-                        # See the standalone-path comment: must actually evict
-                        # (kill), not just forget, or a still-alive process
-                        # orphans and its VRAM is never reclaimed.
-                        stale = state.loaded.pop(alias.name, None)
-                        if stale is not None:
-                            await evict_model(stale)
-                        return openai_error(503, f"Model '{requested_label}' is not responding (it may have crashed).",
-                                             code="model_unavailable")
-                    except aiohttp.ClientConnectionError as e:
-                        # See the standalone-path comment — a reset/closed
-                        # transport mid-request is very often just the
-                        # incoming client cancelling, not a dead backend.
-                        print(f"[proxy] '{alias.name}' (fallback alias) request failed after {type(e).__name__}: {e} (not evicting)")
-                        return openai_error(503, f"Request to '{requested_label}' failed: {e}", code="request_failed")
+                    # Claim it before releasing the lock below — see the
+                    # in_flight comment further down; without this, a
+                    # concurrent activate_scenario (e.g. comfy_coexist
+                    # reverting) could evict this exact model out from under
+                    # the forward() call we're about to make outside the lock.
+                    alias.in_flight += 1
                 # Nothing resident can cover it (or, for an image request, nothing
                 # resident that both covers it and can actually see) — normally
                 # "no cheaper option than switching", EXCEPT when comfy_coexist
                 # is active: preempting it isn't automatically safe, so decide
                 # with two checks instead of just assuming either way.
-            if state.image_cfg is not None and state.active_scenario == state.image_cfg.get("coexist_scenario"):
-                grace_s = state.image_cfg.get("startup_grace_s", 60)
-                within_grace = (state.comfy_activated_at is not None
-                                 and time.monotonic() - state.comfy_activated_at < grace_s)
-                # 1. Startup grace period: comfy_coexist may have JUST activated
-                #    and ComfyUI may still be mid-load — nvidia-smi's live
-                #    reading would understate its eventual footprint, so don't
-                #    even attempt a fit-check yet; assume busy unconditionally.
-                # 2. Otherwise, check empirically (live nvidia-smi, not an
-                #    inferred/stale signal) whether the requested scenario
-                #    would actually fit if the coexistence model were evicted
-                #    — see scenario_fits_after_comfy_evict's own docstring for
-                #    why this replaced trusting active_scenario alone (that
-                #    flag can outlive the coexistence model actually being
-                #    loaded, e.g. if it crashed, which previously left every
-                #    request stuck here forever with no path back to normal).
-                if within_grace or not await scenario_fits_after_comfy_evict(state, scenario_name):
-                    return openai_error(503, f"Image generation is active and holding GPU memory — "
-                                              f"'{requested_label}' can't be loaded until it finishes.",
-                                         code="image_generation_busy")
-            await activate_scenario(state, scenario_name, state.load_timeout_s)
+            if alias is None:
+                if state.image_cfg is not None and state.active_scenario == state.image_cfg.get("coexist_scenario"):
+                    grace_s = state.image_cfg.get("startup_grace_s", 60)
+                    within_grace = (state.comfy_activated_at is not None
+                                     and time.monotonic() - state.comfy_activated_at < grace_s)
+                    # 1. Startup grace period: comfy_coexist may have JUST activated
+                    #    and ComfyUI may still be mid-load — nvidia-smi's live
+                    #    reading would understate its eventual footprint, so don't
+                    #    even attempt a fit-check yet; assume busy unconditionally.
+                    # 2. Otherwise, check empirically (live nvidia-smi, not an
+                    #    inferred/stale signal) whether the requested scenario
+                    #    would actually fit if the coexistence model were evicted
+                    #    — see scenario_fits_after_comfy_evict's own docstring for
+                    #    why this replaced trusting active_scenario alone (that
+                    #    flag can outlive the coexistence model actually being
+                    #    loaded, e.g. if it crashed, which previously left every
+                    #    request stuck here forever with no path back to normal).
+                    if within_grace or not await scenario_fits_after_comfy_evict(state, scenario_name):
+                        return openai_error(503, f"Image generation is active and holding GPU memory — "
+                                                  f"'{requested_label}' can't be loaded until it finishes.",
+                                             code="image_generation_busy")
+                await activate_scenario(state, scenario_name, state.load_timeout_s)
 
-        lm = state.loaded.get(target["name"])
-        if lm is None:
-            scenario = state.scenarios[scenario_name]
-            port = scenario["port"] if target["slot"] == "primary" else scenario["port_secondary"]
-            ctx = state.reserved_ctx[target["name"]]
-            print(f"[proxy] on-demand spawning '{target['name']}' on port {port} (ctx={ctx:,}) for request to '{requested_label}'")
-            try:
-                lm = await spawn_model(state, target["name"], port, ctx, state.load_timeout_s)
-            except RuntimeError as e:
-                return openai_error(503, str(e))
-            state.loaded[target["name"]] = lm
+        if alias is None:
+            lm = state.loaded.get(target["name"])
+            if lm is None:
+                scenario = state.scenarios[scenario_name]
+                port = scenario["port"] if target["slot"] == "primary" else scenario["port_secondary"]
+                ctx = state.reserved_ctx[target["name"]]
+                print(f"[proxy] on-demand spawning '{target['name']}' on port {port} (ctx={ctx:,}) for request to '{requested_label}'")
+                try:
+                    lm = await spawn_model(state, target["name"], port, ctx, state.load_timeout_s)
+                except RuntimeError as e:
+                    return openai_error(503, str(e))
+                state.loaded[target["name"]] = lm
+
+    if alias is not None:
+        # spawn_lock released above — see the in_flight comment below, this
+        # mirrors the primary path exactly instead of holding the lock across
+        # a potentially long chat stream (previously blocked every other
+        # scenario switch, including comfy_coexist activating/reverting, for
+        # the fallback request's entire duration).
+        try:
+            result = await forward(request, state, body, alias.port, requested_label, alias.name, state.max_wait_s)
+            # Deliberately NOT bumping alias.last_used here: this request
+            # wasn't actually FOR alias's own scenario, just served by it as
+            # a fallback (see find_fallback) -- if we treated fallback
+            # traffic as "activity" for it, a scenario could stay resident
+            # indefinitely just from covering someone else's chat, blocking
+            # maybe_evict_idle_scenario from ever reverting to the
+            # higher-priority/default model that request actually wanted.
+            # comfy_coexist relies on this too, just from the other
+            # direction: its own revert timer is entirely driven by
+            # watch_comfy_queue_and_revert (new /comfyui/prompt calls), not
+            # by last_used/keep_alive at all (see maybe_evict_idle_scenario's
+            # explicit exemption for it) -- so fallback-served chat traffic
+            # already couldn't extend its stay, and this keeps it that way
+            # explicitly rather than by omission. A request genuinely
+            # addressed to alias's own label still updates last_used via the
+            # ordinary (non-fallback) path below.
+            return result
+        except asyncio.CancelledError:
+            print(f"[proxy] request for '{alias.name}' (fallback alias) cancelled (client disconnected?) — not evicting")
+            raise
+        except aiohttp.ClientConnectorError as e:
+            print(f"[proxy] '{alias.name}' (fallback alias) evicted after {type(e).__name__}: {e}")
+            async with state.spawn_lock:
+                stale = state.loaded.pop(alias.name, None)
+                if stale is not None:
+                    await evict_model(stale)
+            if alias.preempted_reason == "image_generation":
+                return preempted_error(requested_label)
+            return openai_error(503, f"Model '{requested_label}' is not responding (it may have crashed).",
+                                 code="model_unavailable")
+        except aiohttp.ClientConnectionError as e:
+            # See the standalone-path comment — a reset/closed transport
+            # mid-request is very often just the incoming client cancelling,
+            # not a dead backend. BUT if drain_in_flight_before_evict already
+            # flagged this exact model as force-evicted for image generation,
+            # that's not a spurious client-side cancel.
+            print(f"[proxy] '{alias.name}' (fallback alias) request failed after {type(e).__name__}: {e} (not evicting)")
+            if alias.preempted_reason == "image_generation":
+                return preempted_error(requested_label)
+            return openai_error(503, f"Request to '{requested_label}' failed: {e}", code="request_failed")
+        finally:
+            alias.in_flight -= 1
 
     # in_flight is read by activate_scenario (via drain_in_flight_before_evict)
     # to avoid killing this model out from under this exact request — spawn_lock
@@ -1025,6 +1066,25 @@ async def handle_status(request):
     # nothing gets evicted on idle no matter how long it's been sitting there.
     active_is_default = (state.active_scenario is not None
                           and state.scenarios[state.active_scenario].get("default", False))
+    # comfy_coexist is exempt from that same keep_alive-based sweep entirely
+    # — its own dedicated queue-driven revert path (watch_comfy_queue_and_revert)
+    # doesn't consult keep_alive/last_used at all, and last_used itself barely
+    # moves for it: image generation never touches the LLM's last_used (that's
+    # a completely separate process), and fallback-served chat traffic
+    # deliberately doesn't either (see handle_completion) — only a direct
+    # request to its own label would. A keep_alive-based idle/evict figure for
+    # it would be both meaningless AND misleading (counting down to "due" and
+    # then just... not happening). Report the real driver instead: time since
+    # ComfyUI's queue last drained, counting down revert_delay_s from there —
+    # None/None while still generating, since that clock hasn't started yet.
+    active_is_comfy_coexist = (state.image_cfg is not None
+                                and state.active_scenario == state.image_cfg.get("coexist_scenario"))
+    comfy_idle_for_s = None
+    comfy_evict_in_s = None
+    if active_is_comfy_coexist and state.comfy_queue_drained_at is not None:
+        comfy_idle_for_s = round(now - state.comfy_queue_drained_at, 1)
+        comfy_evict_in_s = round(max(0.0, state.image_cfg["revert_delay_s"]
+                                     - (now - state.comfy_queue_drained_at)), 1)
     scenario_models = []
     if state.active_scenario is not None:
         scenario = state.scenarios[state.active_scenario]
@@ -1032,6 +1092,12 @@ async def handle_status(request):
             lm = state.loaded.get(m["name"])
             port = scenario["port"] if m.get("slot", "primary") == "primary" else scenario["port_secondary"]
             keep_alive = state.options.get(m["name"], {}).get("keep_alive", "")
+            if active_is_comfy_coexist:
+                idle_for_s, evict_in_s = comfy_idle_for_s, comfy_evict_in_s
+            else:
+                idle_for_s = None if lm is None else round(now - lm.last_used, 1)
+                evict_in_s = (None if lm is None or active_is_default or parse_keep_alive(keep_alive) is None
+                              else round(max(0.0, parse_keep_alive(keep_alive) - (now - lm.last_used)), 1))
             scenario_models.append({
                 "name": m["name"],
                 "label": m.get("label", m["name"]),
@@ -1040,9 +1106,8 @@ async def handle_status(request):
                 "ctx_size": state.reserved_ctx.get(m["name"]),
                 "loaded": lm is not None,
                 "keep_alive": keep_alive,
-                "idle_for_s": None if lm is None else round(now - lm.last_used, 1),
-                "evict_in_s": (None if lm is None or active_is_default or parse_keep_alive(keep_alive) is None
-                               else round(max(0.0, parse_keep_alive(keep_alive) - (now - lm.last_used)), 1)),
+                "idle_for_s": idle_for_s,
+                "evict_in_s": evict_in_s,
             })
     return web.json_response({
         "active_scenario": state.active_scenario,
@@ -1062,8 +1127,13 @@ async def handle_status(request):
             for s in state.scenarios.values()
         ],
         "image_backend": (None if state.image_cfg is None else {
-            "active": state.active_scenario == state.image_cfg["coexist_scenario"],
+            "active": active_is_comfy_coexist,
             "pre_comfy_scenario": state.pre_comfy_scenario,
+            "revert_delay_s": state.image_cfg["revert_delay_s"],
+            # Same figure as comfy_evict_in_s above (None while ComfyUI's
+            # queue is still busy — revert_delay_s hasn't started counting
+            # down yet — or whenever comfy_coexist isn't active at all).
+            "revert_in_s": comfy_evict_in_s,
         }),
     })
 

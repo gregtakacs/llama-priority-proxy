@@ -3,6 +3,6 @@
   "base_url": "http://comfyui:8188",
   "coexist_scenario": "comfy_coexist",
   "queue_poll_interval_s": 2,
-  "revert_delay_s": 240,
+  "revert_delay_s": 120,
   "startup_grace_s": 60
 }
