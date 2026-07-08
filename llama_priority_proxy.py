@@ -42,7 +42,7 @@ import aiohttp
 from aiohttp import web
 
 from llama_process import (
-    format_bytes, gpu_total_bytes, gpu_used_bytes,
+    format_bytes, gpu_stats, gpu_total_bytes, gpu_used_bytes,
     launch_server, max_ctx_for_budget, predicted_vram, shutdown_server, wait_for_health,
 )
 
@@ -1061,6 +1061,7 @@ async def handle_status(request):
     now = time.monotonic()
     gpu_total = gpu_total_bytes(state.gpu_index)
     gpu_used = gpu_used_bytes(state.gpu_index)
+    gpu_extra = gpu_stats(state.gpu_index)
     # Idle-eviction only ever reverts a non-default scenario (see
     # maybe_evict_idle_scenario) — while the default scenario is active,
     # nothing gets evicted on idle no matter how long it's been sitting there.
@@ -1120,6 +1121,9 @@ async def handle_status(request):
             "total": format_bytes(gpu_total),
             "used": format_bytes(gpu_used),
             "free": format_bytes(gpu_total - gpu_used) if gpu_used is not None else None,
+            "utilization_pct": gpu_extra["utilization_pct"],
+            "power_draw_w": gpu_extra["power_draw_w"],
+            "power_limit_w": gpu_extra["power_limit_w"],
         },
         "scenarios": [
             {"name": s["name"], "priority": s["priority"], "default": s.get("default", False),

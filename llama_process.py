@@ -67,6 +67,35 @@ def gpu_used_bytes(gpu_index=0):
     return int(float(result.stdout.strip().splitlines()[0])) * 1024 * 1024
 
 
+def gpu_stats(gpu_index=0):
+    """Utilization + power draw/limit for the dashboard's GPU card -- kept as its own
+    single nvidia-smi call rather than folded into gpu_total_bytes/gpu_used_bytes above,
+    since those two are also used standalone by the scenario-sizing math (VRAM budget
+    calculations that don't care about utilization/power at all); this is purely a
+    display convenience for /status."""
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=utilization.gpu,power.draw,power.limit",
+         "--format=csv,noheader,nounits", f"--id={gpu_index}"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return {"utilization_pct": None, "power_draw_w": None, "power_limit_w": None}
+
+    def _num(s):
+        try:
+            return float(s.strip())
+        except ValueError:
+            return None  # e.g. "[N/A]" -- some GPUs/drivers don't report a given metric
+
+    util, power_draw, power_limit = result.stdout.strip().splitlines()[0].split(", ")
+    util_val = _num(util)
+    return {
+        "utilization_pct": None if util_val is None else int(util_val),
+        "power_draw_w": _num(power_draw),
+        "power_limit_w": _num(power_limit),
+    }
+
+
 class ServerHandle:
     """kind='native': proc + log_path are set. kind='docker': container_name is
     set (None if `docker run` itself failed to even start, in which case

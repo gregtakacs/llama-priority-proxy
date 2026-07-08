@@ -209,6 +209,12 @@
       <div class="gpu-text"><strong id="gpuUsed">—</strong> used of <strong id="gpuTotal">—</strong></div>
       <div class="gpu-bar-wrap"><div class="gpu-bar" id="gpuBar"></div></div>
       <div class="gpu-text" id="gpuFree" style="margin-top:4px;"></div>
+
+      <div class="gpu-text" style="margin-top:14px;">Utilization: <strong id="gpuUtilText">—</strong></div>
+      <div class="gpu-bar-wrap"><div class="gpu-bar" id="gpuUtilBar"></div></div>
+
+      <div class="gpu-text" style="margin-top:14px;">Power: <strong id="gpuPowerText">—</strong></div>
+      <div class="gpu-bar-wrap"><div class="gpu-bar" id="gpuPowerBar"></div></div>
     </div>
 
     <div class="card card-fill">
@@ -380,6 +386,12 @@ function formatBytes(b) {
 
 function fmtNum(n) { return n.toLocaleString(); }
 
+function barColorFor(pct) {
+  if (pct > 80) return 'linear-gradient(90deg, #f87171, #fb923c)';
+  if (pct > 50) return 'linear-gradient(90deg, #facc15, #fb923c)';
+  return 'linear-gradient(90deg, #4ade80, #facc15)';
+}
+
 function fmtIdle(secs) {
   if (secs < 1) return 'just now';
   if (secs < 60) return `${Math.round(secs)}s`;
@@ -461,9 +473,36 @@ function renderStatus(data) {
     const pct = totalBytes > 0 ? Math.min(100, (usedBytes / totalBytes) * 100) : 0;
     const bar = document.getElementById('gpuBar');
     bar.style.width = pct + '%';
-    if (pct > 80) bar.style.background = 'linear-gradient(90deg, #f87171, #fb923c)';
-    else if (pct > 50) bar.style.background = 'linear-gradient(90deg, #facc15, #fb923c)';
-    else bar.style.background = 'linear-gradient(90deg, #4ade80, #facc15)';
+    bar.style.background = barColorFor(pct);
+
+    const utilPct = data.gpu.utilization_pct;
+    const utilBar = document.getElementById('gpuUtilBar');
+    const utilText = document.getElementById('gpuUtilText');
+    if (utilPct == null) {
+      utilText.textContent = 'N/A';
+      utilBar.style.width = '0%';
+    } else {
+      utilText.textContent = `${utilPct}%`;
+      utilBar.style.width = Math.min(100, utilPct) + '%';
+      utilBar.style.background = barColorFor(utilPct);
+    }
+
+    const powerDraw = data.gpu.power_draw_w;
+    const powerLimit = data.gpu.power_limit_w;
+    const powerBar = document.getElementById('gpuPowerBar');
+    const powerText = document.getElementById('gpuPowerText');
+    if (powerDraw == null) {
+      powerText.textContent = 'N/A';
+      powerBar.style.width = '0%';
+    } else if (powerLimit) {
+      const powerPct = Math.min(100, (powerDraw / powerLimit) * 100);
+      powerText.textContent = `${powerDraw.toFixed(0)}W / ${powerLimit.toFixed(0)}W`;
+      powerBar.style.width = powerPct + '%';
+      powerBar.style.background = barColorFor(powerPct);
+    } else {
+      powerText.textContent = `${powerDraw.toFixed(0)}W`;
+      powerBar.style.width = '0%';
+    }
   }
 
   renderScenarioModelsTable(data.scenario_models || []);
