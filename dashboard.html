@@ -35,6 +35,8 @@
     letter-spacing: -0.02em;
   }
   h1 span { color: var(--accent); }
+  h1 a { color: var(--text-dim); font-size: 0.8rem; font-weight: 500; margin-left: 16px; text-decoration: none; }
+  h1 a:hover { color: var(--accent); }
   .grid { display: grid; gap: 16px; }
   .grid-2 { grid-template-columns: 1fr 1fr; }
   .grid-3 { grid-template-columns: 2fr 1fr 1fr; }
@@ -130,6 +132,13 @@
     background: rgba(74,222,128,0.12); color: var(--green);
     font-size: 0.68rem; padding: 2px 7px; border-radius: 10px; font-weight: 600;
   }
+  .scenario-item .pinned-badge {
+    background: rgba(251,146,60,0.15); color: var(--orange);
+    font-size: 0.68rem; padding: 2px 7px; border-radius: 10px; font-weight: 600;
+    margin-left: 4px;
+  }
+  .scenario-item .pin-btn { margin-left: auto; }
+  .scenario-item.pinned:not(.active) { border: 1px solid var(--orange); }
   .empty { color: var(--text-dim); font-size: 0.85rem; padding: 8px 0; }
   .refresh-info { font-size: 0.75rem; color: var(--text-dim); }
   .hidden { display: none; }
@@ -147,7 +156,7 @@
 </head>
 <body>
 
-<h1>🐫 <span>Llama</span> Priority Proxy</h1>
+<h1>🐫 <span>Llama</span> Priority Proxy <a href="/admin" id="registeredUsersLink" class="hidden">Registered Users →</a></h1>
 
 <div id="loginGate" class="card" style="max-width:360px;margin:64px auto;text-align:center;">
   <div class="card-title">Enter Proxy API Key</div>
@@ -443,9 +452,18 @@ function renderStatus(data) {
   if (activeScenarioDef) {
     metaParts.push(`Priority: ${activeScenarioDef.priority}`);
     if (activeScenarioDef.default) metaParts.push('Default');
+    if (activeScenarioDef.pinned) metaParts.push('📌 Pinned — priority feature disabled');
   }
   metaParts.push(`${loadedCount}/${scenarioModels.length} model${scenarioModels.length !== 1 ? 's' : ''} loaded`);
   document.getElementById('scenarioMeta').textContent = metaParts.join(' · ');
+
+  // image_backend is null in /status whenever config/image_backend.json doesn't exist at
+  // all (see handle_status) -- distinct from image_backend.active being false (configured,
+  // just not generating right now). Only the null case means "no ComfyUI here at all,"
+  // which is when the registered-users admin page (comfyui-mcp's per-user image
+  // attribution, irrelevant to a deployment that's just doing LLM scenario switching)
+  // shouldn't be surfaced at all.
+  document.getElementById('registeredUsersLink').classList.toggle('hidden', data.image_backend == null);
 
   const comfyEl = document.getElementById('comfyRevertMeta');
   if (data.image_backend?.active) {
@@ -734,13 +752,17 @@ function renderScenariosList(scenarios) {
   }
   let html = '';
   for (const s of scenarios) {
-    const cls = s.active ? 'active' : '';
+    const cls = `${s.active ? 'active' : ''} ${s.pinned ? 'pinned' : ''}`.trim();
     const defaultBadge = s.default ? '<span class="default-badge">default</span>' : '';
+    const pinnedBadge = s.pinned ? '<span class="pinned-badge">📌 pinned</span>' : '';
     const clickAttr = s.active ? '' : ` data-scenario="${s.name}"`;
+    const pinAction = s.pinned ? 'unpin' : 'pin';
+    const pinLabel = s.pinned ? 'Unpin' : 'Pin';
     html += `<div class="scenario-item ${cls}"${clickAttr}>
       ${s.active ? '<span style="color:var(--accent);font-size:0.8rem;">●</span>' : '<span style="color:var(--text-dim);font-size:0.8rem;">○</span>'}
-      <span class="name">${s.name} ${defaultBadge}</span>
+      <span class="name">${s.name} ${defaultBadge}${pinnedBadge}</span>
       <span class="priority">#${s.priority}</span>
+      <button class="btn-sm pin-btn" data-pin-action="${pinAction}" data-pin-scenario="${s.name}">${pinLabel}</button>
     </div>`;
   }
   container.innerHTML = html;
@@ -764,7 +786,38 @@ function closeSwitchModal() {
   pendingScenario = null;
 }
 
-document.getElementById('scenariosList').addEventListener('click', (e) => {
+document.getElementById('scenariosList').addEventListener('click', async (e) => {
+  const pinBtn = e.target.closest('button[data-pin-action]');
+  if (pinBtn) {
+    // Stop this from also bubbling into the scenario-item switch-modal
+    // handling below (the button lives inside that same clickable row).
+    e.stopPropagation();
+    const action = pinBtn.getAttribute('data-pin-action');
+    const name = pinBtn.getAttribute('data-pin-scenario');
+    const original = pinBtn.textContent;
+    pinBtn.disabled = true;
+    pinBtn.textContent = action === 'pin' ? 'Pinning…' : 'Unpinning…';
+    hideError();
+    try {
+      const resp = await fetch(`/scenarios/${encodeURIComponent(name)}/${action}`,
+                                { method: 'POST', headers: authHeaders() });
+      if (resp.status === 401) {
+        clearStoredKey();
+        showLogin('Invalid or expired API key.');
+        return;
+      }
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => null);
+        throw new Error(body?.error?.message || `HTTP ${resp.status}`);
+      }
+      await fetchAndRender();
+    } catch (err) {
+      showError(err.message);
+      pinBtn.disabled = false;
+      pinBtn.textContent = original;
+    }
+    return;
+  }
   const item = e.target.closest('.scenario-item[data-scenario]');
   if (!item) return;
   openSwitchModal(item.getAttribute('data-scenario'));

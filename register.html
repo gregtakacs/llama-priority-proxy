@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Register your Open WebUI API key</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2e3345;
+    --text: #e1e4ed;
+    --text-dim: #8b8fa3;
+    --accent: #6c8cff;
+    --green: #4ade80;
+    --red: #f87171;
+    --radius: 10px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    width: 100%;
+    max-width: 420px;
+  }
+  h1 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin-bottom: 8px;
+    letter-spacing: -0.02em;
+  }
+  p.sub {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    margin-bottom: 20px;
+  }
+  label {
+    display: block;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  input {
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 0.9rem;
+    outline: none;
+    font-family: monospace;
+  }
+  input:focus { border-color: var(--accent); }
+  input::placeholder { color: var(--text-dim); font-family: 'Segoe UI', system-ui, sans-serif; }
+  button {
+    margin-top: 16px;
+    width: 100%;
+    cursor: pointer;
+    font-weight: 500;
+    background: var(--accent);
+    color: #fff;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 0.9rem;
+    transition: opacity 0.15s;
+  }
+  button:hover { opacity: 0.9; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .result {
+    margin-top: 14px;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    display: none;
+  }
+  .result.ok { color: var(--green); display: block; }
+  .result.err { color: var(--red); display: block; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Register your API key</h1>
+    <p class="sub">
+      Paste an Open WebUI API key (Settings → Account → API Keys). It's validated
+      directly against your Open WebUI account and stored so image tools can act on
+      your own chats and files. <strong>Registration is required</strong> -- image
+      generation won't work until you do this. Re-paste your key here any time to
+      refresh it (e.g. after rotating it, or if your account email changes).
+    </p>
+    <label for="apiKey">API key</label>
+    <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-...">
+    <button id="submitBtn">Register</button>
+    <div class="result" id="result"></div>
+  </div>
+
+<script>
+const input = document.getElementById('apiKey');
+const btn = document.getElementById('submitBtn');
+const result = document.getElementById('result');
+
+function showResult(ok, msg) {
+  result.className = 'result ' + (ok ? 'ok' : 'err');
+  result.textContent = msg;
+}
+
+async function submit() {
+  const apiKey = input.value.trim();
+  if (!apiKey) {
+    showResult(false, 'Paste your API key first.');
+    return;
+  }
+  btn.disabled = true;
+  result.className = 'result';
+  try {
+    const resp = await fetch('/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: apiKey }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      showResult(true, body.message || `Registered as ${body.email}.`);
+      input.value = '';
+    } else {
+      showResult(false, body.error || `HTTP ${resp.status}`);
+    }
+  } catch (e) {
+    showResult(false, 'Request failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+btn.addEventListener('click', submit);
+input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+</script>
+</body>
+</html>

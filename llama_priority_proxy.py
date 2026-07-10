@@ -52,6 +52,8 @@ DEFAULT_MAX_WAIT_S = 60
 DEFAULT_KEEP_ALIVE_S = 300  # Ollama's own default idle timeout, used for blank/unset keep_alive
 IDLE_SWEEP_INTERVAL_S = 10
 DEFAULT_EVICT_DRAIN_TIMEOUT_S = 40  # see drain_in_flight_before_evict -- ~8k tokens at 200 tok/s
+USER_KEYS_REGISTER_COOLDOWN_S = 4  # global rate limit between /register POSTs, see handle_register_submit
+USER_KEYS_REVALIDATE_INTERVAL_S = 24 * 3600  # see user_keys_revalidation_sweep
 
 _KEEP_ALIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)(s|m|h)$")
 _KEEP_ALIVE_UNITS = {"s": 1, "m": 60, "h": 3600}
@@ -116,16 +118,20 @@ def preempted_error(requested_label):
 
 @web.middleware
 async def auth_middleware(request, handler):
-    # /health and /dashboard (the static HTML/JS shell only — no data) are
-    # exempt: Docker's HEALTHCHECK can't authenticate, and the dashboard page
-    # itself has nothing to hide — it can't see anything until its own JS
-    # supplies this same Bearer key to /status and /slots/*, which ARE
+    # /health, /dashboard, and /admin (static HTML/JS shells only — no data) are
+    # exempt: Docker's HEALTHCHECK can't authenticate, and neither page has
+    # anything to hide — each can't see anything until its own JS supplies this
+    # same Bearer key to /status, /slots/*, or /register/users*, which ARE
     # protected below like every other route.
+    # /register is also exempt — it's the self-service key-registration bootstrap
+    # itself; requiring the shared admin key to reach it would defeat the point.
+    # /register/users* (list/delete/key) deliberately stays OUT of this set —
+    # those ARE admin-only, protected below like everything else.
     # Exact-match only, NEVER startswith: "/" as a startswith-prefix matches
     # every path (everything starts with "/"), which previously exempted the
     # entire API — see the incident this comment is here to prevent recurring.
     api_key = request.app["proxy_api_key"]
-    exempt_paths = {"/health", "/dashboard", "/dashboard/", "/"}
+    exempt_paths = {"/health", "/dashboard", "/dashboard/", "/", "/admin", "/admin/", "/register"}
     # /comfyui/* is also exempt: ComfyUI has no auth of its own, and OpenWebUI's
     # ComfyUI client may not attach the Authorization header to its websocket
     # handshake — same trust posture as the llama-server children today
@@ -164,6 +170,20 @@ def load_json(path, default):
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return default
+
+
+def save_json_atomic(path, data):
+    """Writes data as JSON to path atomically (temp file + os.rename, so a reader never
+    sees a partially-written file) with 0600 permissions -- same plaintext-secret trust
+    posture as this stack's other credential files (e.g. the ollama_token/
+    openwebui_api_key Docker secrets), just runtime-writable instead of a mounted
+    secret. Caller is responsible for serializing concurrent writers (see
+    ProxyState.user_keys_lock)."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp_path, 0o600)
+    os.rename(tmp_path, path)
 
 
 def load_config(config_dir):
@@ -284,6 +304,8 @@ class ProxyState:
         self.standalone = []
         self.label_index = {}
         self.active_scenario = None
+        self.pinned_scenario = None  # scenario name locked by an operator (see handle_pin_scenario) --
+                                      # None means normal priority/idle/comfy_coexist rules apply as before
         self.loaded = {}          # model name -> LoadedModel (scenario-owned)
         self.standalone_loaded = {}  # model name -> LoadedModel
         self.reserved_ctx = {}    # model name -> ctx size, for the active scenario
@@ -297,6 +319,12 @@ class ProxyState:
         self.comfy_queue_drained_at = None  # monotonic timestamp ComfyUI's queue last went empty, or None
                                              # while still generating (or before the first /prompt) — see
                                              # watch_comfy_queue_and_revert and handle_status's revert_in_s
+        self.openwebui_base_url = None   # e.g. http://open-webui:8080, for /register's validation calls
+        self.user_keys_file = None       # on-disk path for the per-user API key store (see load_user_keys)
+        self.user_keys = {}              # email (lowercased) -> {"api_key", "registered_at", "last_validated_at"}
+        self.user_keys_lock = asyncio.Lock()  # serializes read-modify-write of user_keys + its on-disk file
+        self.last_register_attempt = None     # monotonic timestamp, for /register's global rate limit
+        self.user_keys_sweep_task = None      # background user_keys_revalidation_sweep task
 
 
 # ---------------------------------------------------------------------------
@@ -399,10 +427,20 @@ async def activate_comfy_coexist(state):
     own members at this point) so that restore can resume each one's idle
     clock from where it actually was instead of granting a fresh full
     keep_alive window just for having been caught in an unrelated image
-    generation — see restore_pre_comfy_state."""
+    generation — see restore_pre_comfy_state.
+
+    Raises RuntimeError (caller turns this into a clean 503, see
+    handle_comfyui_proxy) if a DIFFERENT scenario is pinned (see
+    handle_pin_scenario) — pinning is meant to lock the GPU down entirely
+    while debugging/working on something, and silently letting image
+    generation preempt it anyway would defeat that."""
     coexist_name = state.image_cfg["coexist_scenario"]
     if state.active_scenario == coexist_name:
         return
+    if state.pinned_scenario is not None and state.pinned_scenario != coexist_name:
+        raise RuntimeError(
+            f"GPU is pinned to '{state.pinned_scenario}' — image generation is blocked until it's unpinned."
+        )
     state.pre_comfy_scenario = state.active_scenario
     state.pre_comfy_last_used = {name: lm.last_used for name, lm in state.loaded.items()}
     await activate_scenario(state, coexist_name, state.load_timeout_s)
@@ -538,7 +576,9 @@ async def watch_comfy_queue_and_revert(state):
     cancels any previous instance first — only one of these runs at a time.
     Polls ComfyUI's queue until it drains, waits a settle window to absorb
     back-to-back submissions, then frees ComfyUI and restores whatever
-    scenario was active before comfy_coexist took over."""
+    scenario was active before comfy_coexist took over -- unless comfy_coexist
+    itself is pinned (see handle_pin_scenario), in which case it just stays
+    resident indefinitely instead of reverting."""
     cfg = state.image_cfg
     state.comfy_queue_drained_at = None  # still generating — see handle_status's revert_in_s
     while True:
@@ -551,6 +591,9 @@ async def watch_comfy_queue_and_revert(state):
     async with state.spawn_lock:
         if state.active_scenario != cfg["coexist_scenario"]:
             return  # already legitimately preempted by something else (e.g. a vision request)
+        if state.pinned_scenario == cfg["coexist_scenario"]:
+            print("[proxy] comfy_coexist queue drained but the scenario is pinned — staying resident")
+            return
         # activate_scenario's own hook frees ComfyUI's memory as part of
         # leaving comfy_coexist — no need to duplicate that call here.
         default_name = next(name for name, s in state.scenarios.items() if s.get("default"))
@@ -672,10 +715,14 @@ async def maybe_evict_idle_scenario(state):
     """If the active scenario is non-default and EVERY one of its loaded
     members has gone idle past its own keep_alive, evict it and reactivate
     the default scenario. A single keep_alive=-1 member is enough to keep the
-    whole scenario resident (it's pinned, so the scenario can't be "all idle"
-    while it's still running)."""
+    whole scenario resident (that member is pinned in the keep_alive sense,
+    so the scenario can't be "all idle" while it's still running -- a
+    different, model-level thing from an operator-level scenario pin, see
+    below)."""
     if state.active_scenario is None:
         return
+    if state.pinned_scenario == state.active_scenario:
+        return  # operator-pinned (see handle_pin_scenario) — never idle-evicted
     if state.scenarios[state.active_scenario].get("default"):
         return  # already the baseline — nothing to revert to
     if state.image_cfg is not None and state.active_scenario == state.image_cfg.get("coexist_scenario"):
@@ -906,7 +953,11 @@ async def handle_completion(request):
             active_priority = (state.scenarios[state.active_scenario]["priority"]
                                 if state.active_scenario else -1)
             outranks_active = state.scenarios[scenario_name]["priority"] > active_priority
-            if not outranks_active:
+            # An operator pin (see handle_pin_scenario) overrides priority entirely --
+            # "nothing unloads it" means even a normally-outranking request must be
+            # served via fallback (or refused, below) instead of switching away.
+            pinned = state.pinned_scenario is not None and state.pinned_scenario == state.active_scenario
+            if not outranks_active or pinned:
                 alias = find_fallback(state, scenario_name, require_vision=has_image)
                 if alias is not None:
                     # Claim it before releasing the lock below — see the
@@ -921,6 +972,15 @@ async def handle_completion(request):
                 # is active: preempting it isn't automatically safe, so decide
                 # with two checks instead of just assuming either way.
             if alias is None:
+                if pinned:
+                    return openai_error(
+                        503,
+                        f"'{state.active_scenario}' is pinned and nothing currently loaded covers "
+                        f"'{requested_label}' via fallback_for -- refusing to switch scenarios while "
+                        f"pinned. Unpin it first (see /scenarios/{state.active_scenario}/unpin) if this "
+                        f"request should go through.",
+                        code="scenario_pinned",
+                    )
                 if state.image_cfg is not None and state.active_scenario == state.image_cfg.get("coexist_scenario"):
                     grace_s = state.image_cfg.get("startup_grace_s", 60)
                     within_grace = (state.comfy_activated_at is not None
@@ -1112,6 +1172,7 @@ async def handle_status(request):
             })
     return web.json_response({
         "active_scenario": state.active_scenario,
+        "pinned_scenario": state.pinned_scenario,
         "scenario_models": scenario_models,
         "standalone_models": [
             {"name": lm.name, "port": lm.port, "ctx_size": lm.ctx_size}
@@ -1127,7 +1188,7 @@ async def handle_status(request):
         },
         "scenarios": [
             {"name": s["name"], "priority": s["priority"], "default": s.get("default", False),
-             "active": s["name"] == state.active_scenario}
+             "active": s["name"] == state.active_scenario, "pinned": s["name"] == state.pinned_scenario}
             for s in state.scenarios.values()
         ],
         "image_backend": (None if state.image_cfg is None else {
@@ -1147,9 +1208,55 @@ async def handle_activate_scenario(request):
     Unlike a normal request, this ignores priority entirely: the operator
     explicitly asked for this scenario, so it switches regardless of whether
     it would "outrank" whatever's currently active. That's only a one-time
-    nudge, not a pin — the very next incoming request still routes by the
-    usual priority/fallback rules, so a higher-priority scenario reclaims
-    its spot the moment it's actually needed again."""
+    nudge, not a pin (see handle_pin_scenario for the real thing) — the very
+    next incoming request still routes by the usual priority/fallback rules,
+    so a higher-priority scenario reclaims its spot the moment it's actually
+    needed again.
+
+    Refuses to switch away from a DIFFERENT pinned scenario -- pin is meant to
+    be a hard lock, and a stray/accidental dashboard click shouldn't silently
+    override it. Activating the pinned scenario itself (already a no-op most
+    of the time) still works normally; explicit /unpin is the only way to
+    switch elsewhere."""
+    state = request.app["state"]
+    name = request.match_info["name"]
+    if name not in state.scenarios:
+        return openai_error(404, f"Unknown scenario '{name}'.", code="scenario_not_found")
+    if state.pinned_scenario is not None and state.pinned_scenario != name:
+        return openai_error(
+            409,
+            f"'{state.pinned_scenario}' is pinned -- unpin it first (see "
+            f"/scenarios/{state.pinned_scenario}/unpin) before activating a different scenario.",
+            code="scenario_pinned",
+        )
+    async with state.spawn_lock:
+        if state.active_scenario != name:
+            try:
+                await activate_scenario(state, name, state.load_timeout_s)
+            except RuntimeError as e:
+                return openai_error(503, str(e))
+    return web.json_response({"active_scenario": state.active_scenario, "pinned_scenario": state.pinned_scenario})
+
+
+async def handle_pin_scenario(request):
+    """POST /scenarios/{name}/pin — locks the GPU to this scenario: idle
+    eviction (maybe_evict_idle_scenario), priority preemption
+    (handle_completion), comfy_coexist auto-activation (activate_comfy_coexist),
+    and comfy_coexist's own queue-drain revert (watch_comfy_queue_and_revert)
+    all refuse to switch away from it until unpinned. Meant for debugging/
+    working on something and wanting the priority feature out of the way
+    entirely -- see the user-facing rationale in the commit this landed with.
+
+    Activates the scenario first if it isn't already active (pinning something
+    not resident would be meaningless). Only one scenario can be pinned at a
+    time -- pinning a new one replaces whatever was pinned before, same
+    operator-explicitly-asked-for-this precedence as handle_activate_scenario.
+
+    While pinned, requests for OTHER scenarios are still served if something
+    already loaded covers them via fallback_for (exactly like a normal
+    lower-priority request would be) -- pin only blocks an actual scenario
+    SWITCH, not all other traffic. A request with no fallback coverage gets a
+    clear 503 instead of triggering the switch pin exists to prevent."""
     state = request.app["state"]
     name = request.match_info["name"]
     if name not in state.scenarios:
@@ -1160,7 +1267,24 @@ async def handle_activate_scenario(request):
                 await activate_scenario(state, name, state.load_timeout_s)
             except RuntimeError as e:
                 return openai_error(503, str(e))
-    return web.json_response({"active_scenario": state.active_scenario})
+        state.pinned_scenario = name
+    print(f"[proxy] '{name}' pinned — no automatic switch/eviction will touch it until unpinned")
+    return web.json_response({"active_scenario": state.active_scenario, "pinned_scenario": state.pinned_scenario})
+
+
+async def handle_unpin_scenario(request):
+    """POST /scenarios/{name}/unpin — releases the pin set by handle_pin_scenario.
+    A no-op (not an error) if name isn't the currently pinned scenario, so a
+    stale dashboard button (e.g. two tabs open) can't unpin something else out
+    from under a different pin. Normal priority/idle/comfy_coexist rules
+    resume on the very next decision point -- nothing is forced to switch
+    immediately just from unpinning."""
+    state = request.app["state"]
+    name = request.match_info["name"]
+    if state.pinned_scenario == name:
+        state.pinned_scenario = None
+        print(f"[proxy] '{name}' unpinned — normal priority/idle rules resume")
+    return web.json_response({"active_scenario": state.active_scenario, "pinned_scenario": state.pinned_scenario})
 
 
 async def handle_load_model(request):
@@ -1305,6 +1429,14 @@ async def handle_dashboard(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
 
+async def handle_admin(request):
+    """Serve the registered-users admin HTML (see admin.html) — no auth required for
+    the static shell itself, same posture as /dashboard: the page can't see anything
+    until its own JS supplies the admin Bearer key to /register/users*, which IS
+    protected by auth_middleware like everything else admin-only."""
+    return web.Response(text=ADMIN_HTML, content_type="text/html")
+
+
 # ---------------------------------------------------------------------------
 # Dashboard HTML (served at /dashboard, no auth needed) -- kept in its own
 # dashboard.html file alongside this one rather than embedded as a giant
@@ -1315,6 +1447,175 @@ async def handle_dashboard(request):
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")) as _f:
     DASHBOARD_HTML = _f.read()
 
+# Registered-users admin page (served at /admin, no auth needed for the shell -- see
+# handle_admin) -- same "own file, loaded once at import time" convention as the
+# dashboard above.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin.html")) as _f:
+    ADMIN_HTML = _f.read()
+
+
+# ---------------------------------------------------------------------------
+# User API key registration (served at /register, no auth needed -- this IS the
+# self-service bootstrap mechanism) -- lets each Open WebUI user register their own
+# API key with the proxy instead of every image tool sharing one admin key, so a
+# saved/fetched file is attributed to (and later findable by) whoever actually asked
+# for it. See comfyui-mcp for the consumer side (a separate, later change): it looks
+# up the calling user's own key here via Open WebUI's forwarded
+# X-OpenWebUI-User-Email header instead of a single shared OPENWEBUI_API_KEY.
+# ---------------------------------------------------------------------------
+
+async def validate_openwebui_key(state, api_key):
+    """Confirms api_key is a real, currently-valid Open WebUI API key by hitting its
+    own GET /api/v1/auths/ (Bearer-token authenticated, returns the account's id/email/
+    name/role for whatever key is presented) -- confirmed live against a real Open
+    WebUI instance during design. Returns the account's email (exactly as Open WebUI
+    reports it -- this is the source of truth, never anything a caller typed) on
+    success, or None if the key doesn't validate (wrong/revoked key, or Open WebUI
+    unreachable)."""
+    url = f"{state.openwebui_base_url.rstrip('/')}/api/v1/auths/"
+    try:
+        async with state.http_session.get(
+            url, headers={"Authorization": f"Bearer {api_key}"}, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+    email = data.get("email")
+    return email.strip().lower() if email else None
+
+
+async def _reconcile_and_store_user_key(state, api_key, email):
+    """Shared by handle_register_submit and user_keys_revalidation_sweep: stores
+    api_key under email, first removing any OTHER entry that holds this exact same
+    api_key under a different (now-stale) email -- handles a user's Open WebUI account
+    email having changed since they last registered without leaving an orphaned old
+    entry behind until the next sweep. Must be called under state.user_keys_lock."""
+    now = int(time.time())
+    stale = [e for e, rec in state.user_keys.items() if rec.get("api_key") == api_key and e != email]
+    for e in stale:
+        del state.user_keys[e]
+    existing = state.user_keys.get(email, {})
+    state.user_keys[email] = {
+        "api_key": api_key,
+        "registered_at": existing.get("registered_at", now),
+        "last_validated_at": now,
+    }
+    save_json_atomic(state.user_keys_file, state.user_keys)
+
+
+async def handle_register_page(request):
+    """Serve the registration form (see register.html) -- no auth required."""
+    return web.Response(text=REGISTER_HTML, content_type="text/html")
+
+
+async def handle_register_submit(request):
+    """POST /register {"api_key": "..."} -- validates against Open WebUI and stores/
+    reconciles the (email -> key) mapping. See _reconcile_and_store_user_key for the
+    email-changed/key-rotated reconciliation logic."""
+    state = request.app["state"]
+
+    now = time.monotonic()
+    if state.last_register_attempt is not None:
+        remaining = USER_KEYS_REGISTER_COOLDOWN_S - (now - state.last_register_attempt)
+        if remaining > 0:
+            return web.json_response(
+                {"error": f"Please wait {remaining:.0f}s before trying again."}, status=429
+            )
+    state.last_register_attempt = now
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid request body."}, status=400)
+    api_key = (body.get("api_key") or "").strip()
+    if not api_key:
+        return web.json_response({"error": "api_key is required."}, status=400)
+
+    email = await validate_openwebui_key(state, api_key)
+    if not email:
+        return web.json_response(
+            {"error": "Could not validate that API key against Open WebUI -- double-check it's correct "
+                      "and hasn't been revoked."},
+            status=400,
+        )
+
+    async with state.user_keys_lock:
+        await _reconcile_and_store_user_key(state, api_key, email)
+
+    return web.json_response({"status": "ok", "email": email, "message": f"Registered as {email}."})
+
+
+async def handle_list_registered_users(request):
+    """GET /register/users -- admin-only (protected by auth_middleware like any other
+    route not in exempt_paths). Lists who's registered, never the raw keys."""
+    state = request.app["state"]
+    users = [
+        {"email": email, "registered_at": rec["registered_at"], "last_validated_at": rec["last_validated_at"]}
+        for email, rec in sorted(state.user_keys.items())
+    ]
+    return web.json_response({"users": users})
+
+
+async def handle_delete_registered_user(request):
+    """DELETE /register/users/{email} -- admin-only. Manual removal, e.g. someone
+    leaves the household or a key needs pulling immediately without waiting for the
+    24h revalidation sweep."""
+    state = request.app["state"]
+    email = request.match_info["email"].strip().lower()
+    async with state.user_keys_lock:
+        if email not in state.user_keys:
+            return web.json_response({"error": f"No registration for {email}."}, status=404)
+        del state.user_keys[email]
+        save_json_atomic(state.user_keys_file, state.user_keys)
+    return web.json_response({"status": "ok"})
+
+
+async def handle_get_registered_user_key(request):
+    """GET /register/users/{email}/key -- the actual consumer of this registry (e.g.
+    comfyui-mcp, resolving a per-user Open WebUI API key from the calling user's
+    forwarded email instead of one shared account -- see its openwebui_client.py's
+    resolve_user_api_key). Same admin-only auth gate as the rest of /register/users*
+    (protected by auth_middleware, not in exempt_paths) -- this is a service-to-service
+    call authenticated with the same shared PROXY_API_KEY comfyui-mcp already holds for
+    the /comfyui passthrough, not exposed to end users at all. Returns the raw key,
+    unlike GET /register/users (which deliberately never does) -- callers of this
+    specific endpoint are trusted backend services, not the admin dashboard."""
+    state = request.app["state"]
+    email = request.match_info["email"].strip().lower()
+    rec = state.user_keys.get(email)
+    if not rec:
+        return web.json_response({"error": f"No registration for {email}."}, status=404)
+    return web.json_response({"email": email, "api_key": rec["api_key"]})
+
+
+async def user_keys_revalidation_sweep(state):
+    """Background task, same shape as idle_eviction_sweep: periodically re-validates
+    every stored key against Open WebUI and prunes/reconciles ones that no longer
+    check out (revoked/rotated key, or the account's email changed) -- the backstop for
+    a user who never comes back to manually re-register (see
+    _reconcile_and_store_user_key for the same reconciliation logic the manual
+    /register path uses)."""
+    while True:
+        await asyncio.sleep(USER_KEYS_REVALIDATE_INTERVAL_S)
+        async with state.user_keys_lock:
+            for email, rec in list(state.user_keys.items()):
+                new_email = await validate_openwebui_key(state, rec["api_key"])
+                if new_email is None:
+                    del state.user_keys[email]
+                    print(f"[proxy] user_keys: pruned {email} (key no longer validates)")
+                elif new_email != email:
+                    await _reconcile_and_store_user_key(state, rec["api_key"], new_email)
+                    print(f"[proxy] user_keys: {email} -> {new_email} (account email changed)")
+                else:
+                    rec["last_validated_at"] = int(time.time())
+            save_json_atomic(state.user_keys_file, state.user_keys)
+
+
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "register.html")) as _f:
+    REGISTER_HTML = _f.read()
+
 
 # ---------------------------------------------------------------------------
 # App wiring
@@ -1323,6 +1624,24 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.ht
 async def on_startup(app):
     state = app["state"]
     state.http_session = aiohttp.ClientSession()
+
+    # Unconditional, best-effort ComfyUI VRAM free before any of our own scenario
+    # activation/eager-loading below -- state.active_scenario/pinned_scenario always
+    # start fresh (None) on a new process, with zero memory of what was actually true
+    # a moment before this restart. If comfy_coexist was active (especially pinned --
+    # see handle_pin_scenario) when the proxy itself got restarted, ComfyUI never went
+    # through the normal revert path (watch_comfy_queue_and_revert / activate_scenario's
+    # own "leaving comfy_coexist" hook) that frees its memory, so it can still be
+    # sitting on real VRAM this process has no record of. The default scenario's
+    # eager-load right below sizes itself from a static budget (gpu_total - headroom -
+    # standalone - comfy_reserved_vram_bytes), not a live nvidia-smi read, so stale
+    # ComfyUI VRAM at this point silently starves it instead of being accounted for.
+    # free_comfyui_memory is already safe to call blindly -- best-effort, swallows
+    # errors/timeouts, never raises -- so this is a harmless no-op if ComfyUI has
+    # nothing loaded or isn't even up yet.
+    if state.image_cfg is not None:
+        await free_comfyui_memory(state)
+
     for m in state.standalone:
         lm = await spawn_model(state, m["name"], m["port"], m["ctx"], state.load_timeout_s)
         state.standalone_loaded[m["name"]] = lm
@@ -1336,10 +1655,16 @@ async def on_startup(app):
 
     state.idle_sweep_task = asyncio.create_task(idle_eviction_sweep(state))
 
+    # load_json tolerates a missing file (returns {} on first-ever run before anyone
+    # has registered yet) — no separate "does it exist" check needed.
+    state.user_keys = load_json(state.user_keys_file, {})
+    state.user_keys_sweep_task = asyncio.create_task(user_keys_revalidation_sweep(state))
+
 
 async def on_cleanup(app):
     state = app["state"]
     state.idle_sweep_task.cancel()
+    state.user_keys_sweep_task.cancel()
     if state.comfy_revert_task is not None and not state.comfy_revert_task.done():
         state.comfy_revert_task.cancel()
     for lm in list(state.loaded.values()) + list(state.standalone_loaded.values()):
@@ -1361,13 +1686,21 @@ def build_app(state, proxy_api_key):
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/status", handle_status)
     app.router.add_post("/scenarios/{name}/activate", handle_activate_scenario)
+    app.router.add_post("/scenarios/{name}/pin", handle_pin_scenario)
+    app.router.add_post("/scenarios/{name}/unpin", handle_unpin_scenario)
     app.router.add_post("/models/{name}/load", handle_load_model)
     app.router.add_post("/models/{name}/evict", handle_evict_model)
     app.router.add_get("/slots/{port}", handle_slots_port)
     app.router.add_route("*", "/comfyui/{tail:.*}", handle_comfyui_proxy)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/dashboard", handle_dashboard)
+    app.router.add_get("/admin", handle_admin)
     app.router.add_get("/", handle_dashboard)  # / → dashboard
+    app.router.add_get("/register", handle_register_page)
+    app.router.add_post("/register", handle_register_submit)
+    app.router.add_get("/register/users", handle_list_registered_users)
+    app.router.add_delete("/register/users/{email}", handle_delete_registered_user)
+    app.router.add_get("/register/users/{email}/key", handle_get_registered_user_key)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
@@ -1392,6 +1725,13 @@ def main():
                          help="Max seconds an automatic scenario switch (e.g. comfy_coexist activating) "
                               "will wait for in-flight requests on the model being evicted to finish "
                               "before killing it anyway.")
+    parser.add_argument("--openwebui-base-url",
+                         default=os.environ.get("OPENWEBUI_BASE_URL", "http://open-webui:8080"),
+                         help="Open WebUI's internal service address, used by /register to validate "
+                              "submitted API keys.")
+    parser.add_argument("--user-keys-file",
+                         default=os.environ.get("USER_KEYS_FILE", "/app/data/user_keys.json"),
+                         help="On-disk path for the per-user API key store /register maintains.")
     args = parser.parse_args()
 
     state = ProxyState()
@@ -1401,6 +1741,8 @@ def main():
     state.load_timeout_s = args.load_timeout
     state.max_wait_s = args.max_wait
     state.evict_drain_timeout_s = args.evict_drain_timeout
+    state.openwebui_base_url = args.openwebui_base_url
+    state.user_keys_file = args.user_keys_file
     state.options, state.registry, state.standalone, state.scenarios, state.image_cfg = load_config(args.config_dir)
     state.label_index = build_label_index(state.scenarios, state.standalone, state.options)
 

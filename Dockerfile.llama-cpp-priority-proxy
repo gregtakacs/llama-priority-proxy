@@ -80,7 +80,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # config/ and the models directory are intentionally NOT copied in here —
 # both get bind-mounted at `docker run` time so they can be edited/rebenched
 # without a rebuild, same convention as ollama-priority-proxy's config file.
-COPY llama_process.py llama_priority_proxy.py dashboard.html ./
+COPY llama_process.py llama_priority_proxy.py dashboard.html register.html admin.html ./
 
 ENV MODELS_DIR=/models
 ENV CONFIG_DIR=/app/config

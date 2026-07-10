@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Llama Priority Proxy — Registered Users</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2e3345;
+    --text: #e1e4ed;
+    --text-dim: #8b8fa3;
+    --accent: #6c8cff;
+    --green: #4ade80;
+    --red: #f87171;
+    --radius: 10px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    min-height: 100vh;
+  }
+  h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 20px; letter-spacing: -0.02em; }
+  h1 span { color: var(--accent); }
+  h1 a { color: var(--text-dim); font-size: 0.8rem; font-weight: 500; margin-left: 16px; text-decoration: none; }
+  h1 a:hover { color: var(--accent); }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    max-width: 760px;
+  }
+  .card-title {
+    font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-dim); margin-bottom: 12px; font-weight: 600;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  input, button {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 14px; font-size: 0.875rem; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  input::placeholder { color: var(--text-dim); }
+  button { cursor: pointer; font-weight: 500; transition: all 0.15s; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .btn-danger:hover { border-color: var(--red); color: var(--red); }
+  .btn-sm { padding: 4px 10px; font-size: 0.78rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th { text-align: left; padding: 8px 10px; color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .email { font-weight: 600; }
+  .empty { color: var(--text-dim); font-size: 0.85rem; padding: 8px 0; }
+  .error-msg { color: var(--red); font-size: 0.82rem; margin-top: 8px; }
+  .error-msg.hidden { display: none; }
+  .hidden { display: none; }
+  .refresh-info { font-size: 0.75rem; color: var(--text-dim); }
+  .count-badge { color: var(--text-dim); font-size: 0.72rem; font-weight: 500; text-transform: none; letter-spacing: 0; }
+</style>
+</head>
+<body>
+
+<h1>🐫 <span>Llama</span> Priority Proxy — Registered Users <a href="/dashboard">← Dashboard</a></h1>
+
+<div id="loginGate" class="card" style="max-width:360px;margin:64px auto;text-align:center;">
+  <div class="card-title">Enter Proxy API Key</div>
+  <div style="display:flex;gap:10px;justify-content:center;">
+    <input type="password" id="apiKeyInput" placeholder="API key" autocomplete="current-password" style="max-width:220px;">
+    <button id="apiKeySubmit">Unlock</button>
+  </div>
+  <div class="error-msg hidden" id="loginError"></div>
+</div>
+
+<div id="app" style="display:none;">
+  <div class="card">
+    <div class="card-title">
+      <span>Registered API Keys <span class="count-badge" id="countBadge"></span></span>
+      <span class="refresh-info" id="refreshInfo"></span>
+    </div>
+    <div id="usersTable"></div>
+    <div class="error-msg hidden" id="errorMsg"></div>
+  </div>
+</div>
+
+<script>
+// Same tab-session-only Bearer key convention as dashboard.html -- deliberately
+// not shared storage keys between the two pages (each re-prompts once), simpler
+// than wiring cross-page session handoff for a two-page admin surface.
+const AUTH_STORAGE_KEY = 'llamaProxyAdminApiKey';
+
+function getStoredKey() { return sessionStorage.getItem(AUTH_STORAGE_KEY) || ''; }
+function setStoredKey(k) { sessionStorage.setItem(AUTH_STORAGE_KEY, k); }
+function clearStoredKey() { sessionStorage.removeItem(AUTH_STORAGE_KEY); }
+
+function authHeaders() {
+  const key = getStoredKey();
+  return key ? { 'Authorization': `Bearer ${key}` } : {};
+}
+
+function showLogin(message) {
+  document.getElementById('loginGate').classList.remove('hidden');
+  document.getElementById('app').style.display = 'none';
+  const el = document.getElementById('loginError');
+  if (message) { el.textContent = message; el.classList.remove('hidden'); }
+  else { el.classList.add('hidden'); }
+}
+
+function showApp() {
+  document.getElementById('loginGate').classList.add('hidden');
+  document.getElementById('app').style.display = '';
+}
+
+async function apiFetch(path, opts) {
+  const resp = await fetch(path, { ...opts, headers: { ...(opts?.headers || {}), ...authHeaders() } });
+  if (resp.status === 401) {
+    clearStoredKey();
+    showLogin('Invalid or expired API key.');
+    throw new Error('Unauthorized');
+  }
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => null);
+    throw new Error(body?.error?.message || body?.error || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorMsg');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+function hideError() { document.getElementById('errorMsg').classList.add('hidden'); }
+
+function fmtTime(epochSeconds) {
+  if (epochSeconds == null) return '—';
+  return new Date(epochSeconds * 1000).toLocaleString();
+}
+
+async function loadUsers() {
+  try {
+    const data = await apiFetch('/register/users');
+    hideError();
+    renderUsers(data.users || []);
+    document.getElementById('refreshInfo').textContent = `Last update: ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    if (e.message !== 'Unauthorized') showError(e.message);
+  }
+}
+
+function renderUsers(users) {
+  document.getElementById('countBadge').textContent = `(${users.length})`;
+  const container = document.getElementById('usersTable');
+  if (users.length === 0) {
+    container.innerHTML = '<div class="empty">No users registered yet.</div>';
+    return;
+  }
+  let html = `<table><thead><tr><th>Email</th><th>Registered</th><th>Last validated</th><th></th></tr></thead><tbody>`;
+  for (const u of users) {
+    html += `<tr data-email="${u.email}">
+      <td class="email">${u.email}</td>
+      <td>${fmtTime(u.registered_at)}</td>
+      <td>${fmtTime(u.last_validated_at)}</td>
+      <td><button class="btn-sm btn-danger" data-action="delete" data-email="${u.email}">Remove</button></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+document.getElementById('usersTable').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-action="delete"]');
+  if (!btn) return;
+  const email = btn.getAttribute('data-email');
+  if (!confirm(`Remove ${email}'s registered API key? They'll need to re-register before image tools work for them again.`)) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Removing…';
+  hideError();
+  try {
+    await apiFetch(`/register/users/${encodeURIComponent(email)}`, { method: 'DELETE' });
+    await loadUsers();
+  } catch (err) {
+    if (err.message !== 'Unauthorized') {
+      showError(err.message);
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+});
+
+document.getElementById('apiKeySubmit').addEventListener('click', () => {
+  const val = document.getElementById('apiKeyInput').value.trim();
+  if (val) trySubmitKey(val);
+});
+document.getElementById('apiKeyInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('apiKeySubmit').click();
+});
+
+async function trySubmitKey(key) {
+  setStoredKey(key);
+  try {
+    await apiFetch('/register/users');
+    showApp();
+    await loadUsers();
+  } catch (e) {
+    if (getStoredKey()) showLogin(e.message);
+  }
+}
+
+async function init() {
+  const storedKey = getStoredKey();
+  if (storedKey) {
+    await trySubmitKey(storedKey);
+    return;
+  }
+  // No stored key yet — try without one first, same as dashboard.html: if
+  // PROXY_API_KEY isn't set at all, auth is off for every route and there's
+  // nothing to log in to.
+  try {
+    const resp = await fetch('/register/users');
+    if (resp.ok) {
+      showApp();
+      await loadUsers();
+      return;
+    }
+  } catch (e) { /* fall through to login gate */ }
+  showLogin();
+}
+init();
+</script>
+</body>
+</html>
