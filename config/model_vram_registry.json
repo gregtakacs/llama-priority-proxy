@@ -1,6 +1,31 @@
 {
   "models": [
     {
+      "name": "Qwen2.5-Coder-1.5B.Q8_0",
+      "parallel_tested": 1,
+      "max_ctx": 32768,
+      "base_vram_bytes": 2296381440,
+      "bytes_per_ctx_token": 29696.0,
+      "config_signature": {
+        "parallel": 1,
+        "max_ctx": 32768,
+        "min_ctx": null,
+        "n_gpu_layers": 99,
+        "extra_args": []
+      },
+      "samples": [
+        {
+          "ctx": 4096,
+          "vram_bytes": 2418016256
+        },
+        {
+          "ctx": 32768,
+          "vram_bytes": 3269459968
+        }
+      ],
+      "measured_at": "2026-07-10T22:49:57"
+    },
+    {
       "name": "Qwen3.5-9B-UD-Q4_K_XL",
       "parallel_tested": 1,
       "max_ctx": 32768,

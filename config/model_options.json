@@ -46,6 +46,16 @@
     "unconfigured model can fall into a repeat loop — nothing discourages it."
   ],
   "options": {
+    "Qwen2.5-Coder-1.5B.Q8_0": {
+      "parallel": 1,
+      "label": "Qwen2.5-Coder-1.5B.Q8_0",
+      "keep_alive": "",
+      "_sampling_comment": "FIM/autocomplete model — kept near-deterministic (low temp) but WITHOUT repeat/presence penalty: code legitimately repeats tokens (braces, indentation, identifiers) and penalizing that degrades completions.",
+      "temp": 0.2,
+      "top_k": 20,
+      "top_p": 0.95,
+      "max_ctx": 32768
+    },
     "Qwen3.5-9B-UD-Q4_K_XL": {
       "parallel": 1,
       "label": "Qwen3.5-9B-UD-Q4_K_XL",

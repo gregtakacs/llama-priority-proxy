@@ -7,6 +7,6 @@
   "port_secondary": 11447,
   "models": [
     {"name": "ornith-35b", "ctx": "auto", "slot": "primary", "fallback_for": ["chat", "coding"]},
-    {"name": "qwen2.5-coder-1.5b", "ctx": 8192, "slot": "secondary", "label": "coding-autocomplete", "fallback_for": []}
+    {"name": "Qwen2.5-Coder-1.5B.Q8_0", "ctx": 8192, "slot": "secondary", "label": "coding-autocomplete", "fallback_for": []}
   ]
 }
