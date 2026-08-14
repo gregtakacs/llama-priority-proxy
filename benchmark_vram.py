@@ -59,6 +59,18 @@ Usage:
     python3 benchmark_vram.py solve --registry config/model_vram_registry.json \\
         --budget-gb 31 --scenario config/scenario_coding.json
 
+    # 4. Ground truth: actually LAUNCH the whole scenario (every model solve
+    #    predicted, all resident together, exactly like the live proxy would)
+    #    and hit the primary with a real prompt. `bench`'s single-model 2-point
+    #    fit can be several GB off run-to-run on a noisy/shared GPU (confirmed
+    #    in practice) -- solve's predictions are only as good as that fit, so
+    #    "solve says it fits" is not the same as "it actually works." This is
+    #    the only way to know for sure a scenario both fits AND stays
+    #    performant (i.e. doesn't spill into system/shared memory) under real
+    #    load, not just on paper:
+    python3 benchmark_vram.py validate --models-dir ~/docker/appdata/llm-models \\
+        --image llama-cpp-priority-proxy --scenario config/scenario_coding.json
+
 Assumptions:
   - Single GPU (index 0 by default; override with --gpu-index).
   - Docker backend: `docker` CLI works without sudo for the invoking user, and
@@ -79,13 +91,22 @@ import time
 from llama_process import (
     format_bytes, gpu_total_bytes, gpu_used_bytes,
     handle_pid, launch_server, max_ctx_for_budget, predicted_vram,
-    print_log_tail, shutdown_server, wait_for_health,
+    print_log_tail, send_completion_prompt, send_warmup_prompt, shutdown_server, wait_for_health,
 )
 
 # Fallback ctx sizes to retry with (largest first) if a sample point OOMs.
 CTX_RETRY_FALLBACKS = [131072, 65536, 32768, 16384, 8192, 4096, 2048, 1024]
 
 DEFAULT_HEADROOM_GB = 1.0  # reserved for driver/desktop/other overhead
+
+# Default size of the synthetic /completion warmup prompt each measure_point()
+# trial sends before reading "settled" VRAM (see send_warmup_prompt in
+# llama_process.py). Empirically motivated: a model that measured as fitting
+# via the OLD health-check-only methodology (near-zero predicted headroom,
+# but nominally fitting) turned out to spill several GB into shared/system
+# memory the moment a real ~2,823-token prompt hit it, tanking prefill from
+# 1000+ tok/s to ~34 tok/s. 3072 comfortably exceeds that reproduction case.
+DEFAULT_WARMUP_PROMPT_TOKENS = 3072
 
 # Anchored to this script's own directory rather than left as bare relative
 # paths — otherwise `--write-options`'s default silently resolves against
@@ -318,23 +339,69 @@ def wait_for_vram_settle(pid, gpu_index, poll_s=2, stable_reads=2, max_wait_s=90
     return last
 
 
-def wait_for_baseline_clear(baseline_bytes, gpu_index, tolerance_mb=200, max_wait_s=30):
+def wait_for_aggregate_vram_settle(pre_launch_baseline, gpu_index, poll_s=2, stable_reads=2, max_wait_s=90):
+    """Fallback for wait_for_vram_settle when nvidia-smi's per-process
+    accounting isn't available (observed under WSL2: --query-compute-apps
+    and the 'Processes' table are always empty there, even with a live
+    --gpus all container running, while aggregate --query-gpu=memory.used
+    works fine). Polls aggregate GPU memory.used until it settles, then
+    attributes the delta over pre_launch_baseline to this trial -- accurate
+    as long as nothing else is using the GPU concurrently, same assumption
+    wait_for_baseline_clear below already relies on between trials."""
+    deadline = time.time() + max_wait_s
+    last = None
+    stable_count = 0
+    while time.time() < deadline:
+        cur = gpu_used_bytes(gpu_index)
+        if cur is not None and last is not None:
+            delta = abs(cur - last)
+            if delta <= max(64 * 1024 * 1024, 0.01 * last):
+                stable_count += 1
+                if stable_count >= stable_reads:
+                    return cur - pre_launch_baseline if pre_launch_baseline is not None else cur
+            else:
+                stable_count = 0
+        last = cur
+        time.sleep(poll_s)
+    if last is None or pre_launch_baseline is None:
+        return None
+    return last - pre_launch_baseline
+
+
+def wait_for_baseline_clear(baseline_bytes, gpu_index, tolerance_mb=200, max_wait_s=120):
     """After killing a server, wait for GPU used memory to drop back near baseline
-    before starting the next trial (driver cleanup can lag slightly)."""
+    before starting the next trial (driver cleanup can lag slightly).
+
+    Returns True once cleared, False on timeout. The timeout case matters more
+    than it looks: if this gives up early and the NEXT trial's pre_launch_baseline
+    is captured while stale VRAM from THIS trial hasn't actually been released
+    yet, and the driver then finishes releasing it mid-way through the next
+    trial's own (now much longer, since bench sends a real warmup prompt)
+    measurement window, the next trial's aggregate-diff reading silently
+    UNDERCOUNTS its own usage by whatever amount got freed during that window —
+    caught in practice as a Q3_K_XL entry with an impossibly low ~2.9GB base for
+    a 13GB+ weight file, once warmup made trials long enough to expose it. Print
+    a warning on timeout instead of failing silently, so a bad reading is at
+    least visible instead of quietly poisoning the fit."""
     deadline = time.time() + max_wait_s
     tol = tolerance_mb * 1024 * 1024
     while time.time() < deadline:
         cur = gpu_used_bytes(gpu_index)
         if cur is not None and cur <= baseline_bytes + tol:
-            return
+            return True
         time.sleep(1)
+    cur = gpu_used_bytes(gpu_index)
+    print(f"    [warn] GPU memory didn't clear back to baseline within {max_wait_s}s "
+          f"(baseline={format_bytes(baseline_bytes)}, still at {format_bytes(cur) if cur is not None else 'unknown'}) "
+          f"-- next trial's measurement may be corrupted by this trial's not-yet-released VRAM")
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Measurement
 # ---------------------------------------------------------------------------
 
-def measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend):
+def measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens=0):
     """Launch llama-server at a given ctx, measure settled VRAM, tear down.
     Returns vram_bytes on success, or None if the server OOM'd / failed to start."""
     extra_args = model_cfg.get("extra_args", [])
@@ -355,11 +422,25 @@ def measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend):
             print("    ✗ could not resolve a PID for VRAM measurement")
             print_log_tail(handle)
             return None
+        if warmup_prompt_tokens > 0:
+            print(f"    sending ~{warmup_prompt_tokens:,}-token warmup prompt "
+                  f"(exercises real compute buffers, not just llama.cpp's own tiny startup warmup) ...")
+            ok, reason = send_warmup_prompt(handle, warmup_prompt_tokens, ctx=ctx)
+            if not ok:
+                print(f"    [warn] warmup prompt failed ({reason}) -- measuring VRAM from "
+                      f"bare health-check state instead, result may understate real usage")
         vram = wait_for_vram_settle(pid, gpu_index)
         if vram is None:
-            print("    ✗ could not read per-process VRAM from nvidia-smi")
-            print_log_tail(handle)
-            return None
+            # Per-process accounting unavailable (e.g. WSL2 -- see
+            # wait_for_aggregate_vram_settle's docstring) -- fall back to
+            # aggregate-usage diffing against the pre-launch baseline.
+            vram = wait_for_aggregate_vram_settle(pre_launch_baseline, gpu_index)
+            if vram is None:
+                print("    ✗ could not read per-process OR aggregate VRAM from nvidia-smi")
+                print_log_tail(handle)
+                return None
+            print(f"    ✓ settled at {format_bytes(vram)} (aggregate-diff fallback)")
+            return vram
         print(f"    ✓ settled at {format_bytes(vram)}")
         return vram
     finally:
@@ -420,14 +501,14 @@ def config_signature(model_cfg):
     }
 
 
-def benchmark_model(model_cfg, port, gpu_index, load_timeout_s, backend):
+def benchmark_model(model_cfg, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens=0):
     name = model_cfg["name"]
     print(f"\n{'#'*60}\n# Benchmarking: {name}\n{'#'*60}")
 
     candidates = pick_sample_ctxs(model_cfg)
     points = []
     for ctx in candidates:
-        vram = measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend)
+        vram = measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens)
         if vram is not None:
             points.append((ctx, vram))
             continue
@@ -438,7 +519,7 @@ def benchmark_model(model_cfg, port, gpu_index, load_timeout_s, backend):
             if fb >= ctx:
                 continue
             print(f"    retrying at fallback ctx={fb:,}")
-            vram = measure_point(model_cfg, fb, port, gpu_index, load_timeout_s, backend)
+            vram = measure_point(model_cfg, fb, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens)
             if vram is not None:
                 points.append((fb, vram))
                 break
@@ -456,6 +537,7 @@ def benchmark_model(model_cfg, port, gpu_index, load_timeout_s, backend):
         "base_vram_bytes": round(intercept),
         "bytes_per_ctx_token": slope,
         "config_signature": config_signature(model_cfg),
+        "warmup_prompt_tokens": warmup_prompt_tokens,
         "samples": [{"ctx": c, "vram_bytes": v} for c, v in points],
         "measured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -613,10 +695,15 @@ def cmd_solve_single(registry, name, budget_bytes, target_ctx_per_slot=None):
     print(f"  headroom left:       {format_bytes(budget_bytes - used)}")
 
 
-def cmd_solve_scenario(registry, scenario_path, budget_bytes):
-    with open(scenario_path) as f:
-        scenario = json.load(f)
-
+def resolve_scenario_sizes(registry, scenario, budget_bytes):
+    """Shared by cmd_solve_scenario (prints a report) and cmd_validate (actually
+    launches the result and checks it live). Returns (resolved, auto_result, error):
+      resolved    -- list of (name, ctx, vram_bytes) for every FIXED-ctx model
+      auto_result -- (name, ctx, vram_bytes, parallel) for the one 'auto' model,
+                      or None if the scenario has no 'auto' model
+      error       -- error message string, or None on success (resolved/auto_result
+                      are meaningless if error is set)
+    """
     by_name = {m["name"]: m for m in registry["models"]}
     fixed_total = 0
     auto_entry = None
@@ -625,13 +712,10 @@ def cmd_solve_scenario(registry, scenario_path, budget_bytes):
     for item in scenario["models"]:
         entry = by_name.get(item["name"])
         if entry is None:
-            print(f"[error] '{item['name']}' not found in registry. Run 'bench' first.")
-            return
+            return None, None, f"'{item['name']}' not found in registry. Run 'bench' first."
         if item.get("ctx") == "auto":
             if auto_entry is not None:
-                print("[error] only one model may be 'auto' per scenario — "
-                      "give the others a fixed 'ctx' value.")
-                return
+                return None, None, "only one model may be 'auto' per scenario — give the others a fixed 'ctx' value."
             auto_entry = (item["name"], entry)
         else:
             ctx = int(item["ctx"])
@@ -639,26 +723,202 @@ def cmd_solve_scenario(registry, scenario_path, budget_bytes):
             fixed_total += vram
             resolved.append((item["name"], ctx, vram))
 
-    print(f"\nScenario '{scenario_path}', budget={format_bytes(budget_bytes)}:")
-    for name, ctx, vram in resolved:
-        print(f"  {name}: fixed ctx={ctx:,} -> {format_bytes(vram)}")
-    print(f"  fixed-model subtotal: {format_bytes(fixed_total)}")
-
     if auto_entry is None:
-        print(f"  remaining headroom: {format_bytes(budget_bytes - fixed_total)}")
-        return
+        return resolved, None, None
 
     name, entry = auto_entry
     remaining = budget_bytes - fixed_total
     parallel = entry["parallel_tested"]
     ctx = max_ctx_for_budget(entry, remaining, ctx_cap=entry["max_ctx"] * parallel)
     used = predicted_vram(entry, ctx)
+    return resolved, (name, ctx, used, parallel), None
+
+
+def cmd_solve_scenario(registry, scenario_path, budget_bytes):
+    with open(scenario_path) as f:
+        scenario = json.load(f)
+
+    resolved, auto_result, error = resolve_scenario_sizes(registry, scenario, budget_bytes)
+    if error:
+        print(f"[error] {error}")
+        return
+
+    fixed_total = sum(vram for _, _, vram in resolved)
+    print(f"\nScenario '{scenario_path}', budget={format_bytes(budget_bytes)}:")
+    for name, ctx, vram in resolved:
+        print(f"  {name}: fixed ctx={ctx:,} -> {format_bytes(vram)}")
+    print(f"  fixed-model subtotal: {format_bytes(fixed_total)}")
+
+    if auto_result is None:
+        print(f"  remaining headroom: {format_bytes(budget_bytes - fixed_total)}")
+        return
+
+    name, ctx, used, parallel = auto_result
     print(f"  {name}: auto -> max ctx {ctx:,} tokens ({format_bytes(used)})")
     if parallel > 1:
         print(f"    worst-case per-slot: {ctx // parallel:,} tokens "
               f"(guaranteed floor if all {parallel} slots are simultaneously busy)")
     print(f"  total predicted VRAM: {format_bytes(fixed_total + used)}")
     print(f"  headroom left:        {format_bytes(budget_bytes - fixed_total - used)}")
+
+
+# ---------------------------------------------------------------------------
+# Scenario validation -- actually load the whole scenario (every model
+# `solve` predicted, all resident together, exactly like the live proxy
+# would) and hit it with a real prompt. Motivated directly by two real
+# failures where a single-model bench/solve prediction ("this fits, headroom
+# X") did not survive contact with an actual multi-thousand-token request --
+# solve's math is only ever as good as the two-point fit behind it, and this
+# is the only way to get ground truth instead of another prediction.
+# ---------------------------------------------------------------------------
+
+def _model_cfg_for(name, model_cfgs_by_name):
+    cfg = model_cfgs_by_name.get(name)
+    if cfg is None:
+        raise KeyError(name)
+    return cfg
+
+
+def cmd_validate(args):
+    backend = {"kind": args.backend, "gpu_index": args.gpu_index}
+    if args.backend == "docker":
+        backend["image"] = args.image
+        backend["models_dir"] = args.models_dir
+
+    scenario_path = resolve_config_path(args.scenario)
+    with open(scenario_path) as f:
+        scenario = json.load(f)
+
+    registry = load_registry(resolve_config_path(args.registry))
+    check_config_drift(registry, args.options)
+
+    standalone_path = resolve_config_path(args.standalone)
+    standalone = []
+    if standalone_path and os.path.exists(standalone_path):
+        with open(standalone_path) as f:
+            standalone = json.load(f).get("models", [])
+
+    if args.budget_gb is None:
+        total = gpu_total_bytes(args.gpu_index)
+        args.budget_gb = (total - args.headroom_gb * (1024 ** 3)) / (1024 ** 3)
+        print(f"[info] auto budget: {args.budget_gb:.2f} GB (detected {format_bytes(total)} - "
+              f"{args.headroom_gb} GB headroom)")
+    budget_bytes = int(args.budget_gb * (1024 ** 3))
+
+    # Standalone models are always-resident in the real proxy and DO eat into
+    # the same budget the scenario's own 'auto' sizing assumes -- see
+    # llama_priority_proxy.py's own budget calc. Subtract them here too so
+    # this test's resolved ctx matches what the live proxy would actually pick.
+    by_name = {m["name"]: m for m in registry["models"]}
+    standalone_vram = 0
+    for m in standalone:
+        entry = by_name.get(m["name"])
+        if entry is None:
+            print(f"[error] standalone model '{m['name']}' not found in registry. Run 'bench' first.")
+            return
+        standalone_vram += predicted_vram(entry, int(m["ctx"]))
+    scenario_budget = budget_bytes - standalone_vram
+
+    resolved, auto_result, error = resolve_scenario_sizes(registry, scenario, scenario_budget)
+    if error:
+        print(f"[error] {error}")
+        return
+
+    plan = list(resolved)  # (name, ctx, vram)
+    primary_name = None
+    for item in scenario["models"]:
+        if item.get("slot") == "primary":
+            primary_name = item["name"]
+    if auto_result is not None:
+        name, ctx, used, _parallel = auto_result
+        plan.append((name, ctx, used))
+        if primary_name is None:
+            primary_name = name  # the 'auto' model is virtually always the primary
+    if primary_name is None:
+        primary_name = plan[0][0]  # last resort: just pick the first model
+
+    print(f"\nValidating scenario '{scenario_path}' live (budget={format_bytes(budget_bytes)}, "
+          f"standalone subtotal={format_bytes(standalone_vram)}, primary='{primary_name}'):")
+    for name, ctx, vram in plan:
+        marker = " [primary]" if name == primary_name else ""
+        print(f"  {name}: ctx={ctx:,} (predicted {format_bytes(vram)}){marker}")
+    for m in standalone:
+        print(f"  {m['name']}: ctx={int(m['ctx']):,} (standalone, predicted "
+              f"{format_bytes(predicted_vram(by_name[m['name']], int(m['ctx'])))})")
+
+    model_cfgs_by_name = {cfg["name"]: cfg for cfg in _load_bench_models(args)}
+    to_launch = [(name, ctx) for name, ctx, _ in plan] + [(m["name"], int(m["ctx"])) for m in standalone]
+
+    handles = []
+    port = args.port_base
+    pre_launch_baseline = gpu_used_bytes(args.gpu_index)
+    try:
+        for name, ctx in to_launch:
+            try:
+                cfg = _model_cfg_for(name, model_cfgs_by_name)
+            except KeyError:
+                print(f"  ✗ '{name}' not found under --models-dir {args.models_dir} -- aborting")
+                return
+            print(f"  launching '{name}' ctx={ctx:,} on scratch port {port} ({backend['kind']}) ...")
+            handle = launch_server(cfg["path"], ctx, cfg.get("parallel", 1), port,
+                                    cfg.get("n_gpu_layers", 99), cfg.get("extra_args", []), backend)
+            handles.append((name, handle))
+            port += 1
+
+        for name, handle in handles:
+            ok, reason = wait_for_health(handle, args.load_timeout)
+            if not ok:
+                print(f"  ✗ FAIL: '{name}' never became healthy: {reason}")
+                print_log_tail(handle)
+                return
+        print("  all models healthy — sending real test prompt to primary ...")
+
+        primary_handle = next(h for name, h in handles if name == primary_name)
+        ok, result = send_completion_prompt(primary_handle, args.warmup_prompt_tokens, timeout_s=args.request_timeout)
+        if not ok:
+            print(f"  ✗ FAIL: test prompt to '{primary_name}' did not complete: {result}")
+            print(f"    (this is the same failure mode as a real client hitting a scenario that "
+                  f"looks fine on paper but hasn't actually been load-tested)")
+            return
+
+        vram_with_load = gpu_used_bytes(args.gpu_index)
+        total_bytes = gpu_total_bytes(args.gpu_index)
+        free_bytes = (total_bytes - vram_with_load) if (total_bytes and vram_with_load is not None) else None
+
+        timings = (result or {}).get("timings", {})
+        prompt_tps = timings.get("prompt_per_second")
+        predicted_tps = timings.get("predicted_per_second")
+
+        print(f"\n  Result:")
+        print(f"    prefill:    {prompt_tps:.1f} tok/s" if prompt_tps is not None else "    prefill:    unknown")
+        print(f"    decode:     {predicted_tps:.1f} tok/s" if predicted_tps is not None else "    decode:     unknown")
+        print(f"    live VRAM used: {format_bytes(vram_with_load)}" if vram_with_load is not None else "    live VRAM used: unknown")
+        print(f"    live VRAM free: {format_bytes(free_bytes)}" if free_bytes is not None else "    live VRAM free: unknown")
+
+        fails = []
+        if prompt_tps is None or prompt_tps < args.min_prefill_tps:
+            fails.append(f"prefill {prompt_tps if prompt_tps is not None else '?'} tok/s "
+                         f"< required {args.min_prefill_tps} tok/s")
+        min_free_bytes = args.min_free_mb * 1024 * 1024
+        if free_bytes is None or free_bytes < min_free_bytes:
+            fails.append(f"free VRAM {format_bytes(free_bytes) if free_bytes is not None else '?'} "
+                         f"< required {args.min_free_mb} MB")
+
+        if fails:
+            print(f"\n  ✗ FAIL — scenario fits on paper but is not performant/safe under real load:")
+            for f in fails:
+                print(f"    - {f}")
+            print(f"    This means the config would likely reproduce shared-memory spillover / "
+                  f"drastic slowdown under real traffic -- lower max_ctx and re-validate.")
+        else:
+            print(f"\n  ✓ PASS — fits and performs well under a real "
+                  f"~{args.warmup_prompt_tokens:,}-token request.")
+    finally:
+        print("\n  tearing down ...")
+        for _name, handle in handles:
+            shutdown_server(handle)
+        if pre_launch_baseline is not None:
+            wait_for_baseline_clear(pre_launch_baseline, args.gpu_index, max_wait_s=60)
 
 
 # ---------------------------------------------------------------------------
@@ -876,12 +1136,20 @@ def cmd_bench(args):
         existing = by_name.get(model_cfg["name"])
         if existing is not None and not args.force:
             sig = config_signature(model_cfg)
-            if existing.get("config_signature") == sig:
+            existing_warmup = existing.get("warmup_prompt_tokens", 0)
+            sig_matches = existing.get("config_signature") == sig
+            warmup_matches = existing_warmup == args.warmup_prompt_tokens
+            if sig_matches and warmup_matches:
                 print(f"Skipping '{model_cfg['name']}' (already benchmarked, config unchanged)")
                 continue
-            print(f"Re-benchmarking '{model_cfg['name']}' — config changed since last measurement "
-                  f"(was {existing.get('config_signature')}, now {sig})")
-        entry = benchmark_model(model_cfg, args.port, args.gpu_index, args.load_timeout, backend)
+            if sig_matches:
+                print(f"Re-benchmarking '{model_cfg['name']}' — warmup_prompt_tokens changed "
+                      f"(was {existing_warmup}, now {args.warmup_prompt_tokens})")
+            else:
+                print(f"Re-benchmarking '{model_cfg['name']}' — config changed since last measurement "
+                      f"(was {existing.get('config_signature')}, now {sig})")
+        entry = benchmark_model(model_cfg, args.port, args.gpu_index, args.load_timeout, backend,
+                                 args.warmup_prompt_tokens)
         if entry is not None:
             upsert(registry, entry)
             save_registry(registry, args.output)  # save incrementally
@@ -931,6 +1199,16 @@ def main():
                         "this script inside the same container that has it).")
     b.add_argument("--image", default="llama-cpp-priority-proxy",
                    help="Docker image to run llama-server from (--backend docker only)")
+    b.add_argument("--warmup-prompt-tokens", type=int, default=DEFAULT_WARMUP_PROMPT_TOKENS,
+                   help="Send a synthetic prompt of roughly this many tokens through /completion "
+                        "at each sample point before measuring 'settled' VRAM, so the compute "
+                        "buffers a genuinely-sized real request needs get captured. llama.cpp's own "
+                        "tiny startup warmup alone was found to understate real usage by several GB "
+                        "at large context sizes -- see send_warmup_prompt() in llama_process.py for "
+                        "the reproduction case. Pass 0 to disable (old, faster-but-riskier behavior; "
+                        "only the health-check is used). Stored per-entry in the registry, so changing "
+                        "this value triggers an automatic re-measurement same as any other config drift. "
+                        "(default: %(default)s)")
     b.set_defaults(func=cmd_bench)
 
     s = sub.add_parser("solve", help="Solve max ctx-size for a VRAM budget")
@@ -952,8 +1230,42 @@ def main():
                         "benchmarked (default: %(default)s). Pass --options '' to skip this check.")
     s.set_defaults(func=cmd_solve)
 
+    v = sub.add_parser("validate", help="Actually launch a whole scenario (every model 'solve' would "
+                                          "predict, all resident together) and hit the primary with a "
+                                          "real prompt -- ground truth for 'does this fit AND perform "
+                                          "well', not another prediction. See resolve_scenario_sizes's "
+                                          "docstring / cmd_validate's module comment for why this exists.")
+    v.add_argument("--scenario", required=True, help="Scenario JSON to validate (see config/scenario_coding.json)")
+    v.add_argument("--models-dir", required=True, help="Auto-discover *.gguf files here (name/path/max_ctx all inferred)")
+    v.add_argument("--options", default=_default_config_path("model_options.json"))
+    v.add_argument("--registry", default=_default_config_path("model_vram_registry.json"))
+    v.add_argument("--standalone", default=_default_config_path("standalone_models.json"),
+                   help="Always-on models (e.g. an embedding model) that also eat into the same "
+                        "live budget the real proxy computes -- see standalone_models.json. Pass "
+                        "--standalone '' to ignore.")
+    v.add_argument("--budget-gb", type=float, help="VRAM budget in GB (default: detected total - headroom)")
+    v.add_argument("--headroom-gb", type=float, default=DEFAULT_HEADROOM_GB)
+    v.add_argument("--gpu-index", type=int, default=0)
+    v.add_argument("--port-base", type=int, default=18090, help="First scratch port; each launched model gets the next one")
+    v.add_argument("--load-timeout", type=int, default=300, help="Seconds to wait for /health per model")
+    v.add_argument("--request-timeout", type=int, default=240, help="Seconds to wait for the real test prompt to complete")
+    v.add_argument("--warmup-prompt-tokens", type=int, default=DEFAULT_WARMUP_PROMPT_TOKENS,
+                   help="Size of the real test prompt sent to the scenario's primary model. "
+                        "(default: %(default)s)")
+    v.add_argument("--min-prefill-tps", type=float, default=200.0,
+                   help="Fail if measured prefill (prompt_per_second) drops below this -- normal is "
+                        "1000+ tok/s on this project's hardware, degraded/shared-memory-spillover "
+                        "cases measured ~34 tok/s, so 200 cleanly separates the two. (default: %(default)s)")
+    v.add_argument("--min-free-mb", type=float, default=512.0,
+                   help="Fail if live free VRAM (after the test prompt, with every model in the "
+                        "scenario resident) drops below this. (default: %(default)s)")
+    v.add_argument("--backend", choices=["docker", "native"], default="docker")
+    v.add_argument("--image", default="llama-cpp-priority-proxy",
+                   help="Docker image to run llama-server from (--backend docker only)")
+    v.set_defaults(func=cmd_validate)
+
     args = parser.parse_args()
-    if args.cmd == "solve" and args.budget_gb is None:
+    if args.cmd in ("solve", "validate") and args.budget_gb is None:
         total = gpu_total_bytes(args.gpu_index)
         args.budget_gb = (total - args.headroom_gb * (1024 ** 3)) / (1024 ** 3)
         print(f"[info] auto budget: {args.budget_gb:.2f} GB (detected {format_bytes(total)} - "

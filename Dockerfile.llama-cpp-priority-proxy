@@ -30,6 +30,18 @@ RUN git clone https://github.com/ggml-org/llama.cpp.git . && \
 # during a `docker build`) and -Wl,--allow-shlib-undefined lets the linker
 # defer resolution of driver-API symbols (cuMemCreate, etc.) to container
 # runtime, when nvidia-container-toolkit injects the real libcuda.so.1.
+# -DLLAMA_BUILD_UI=OFF + -DLLAMA_USE_PREBUILT_UI=OFF: llama-server's bundled
+# web UI build (tools/ui/CMakeLists.txt) is an ALL target that always runs;
+# these two flags independently gate its two asset-provisioning paths (npm
+# build, then a "latest" prebuilt dist.tar.gz pulled from Hugging Face at
+# build time -- a moving target that can drift out of sync with what this
+# pinned commit's asset-embedding tool validates; hit this directly: build
+# failed on "missing required asset(s): loading.html"). Setting only
+# LLAMA_BUILD_UI=OFF still hits the HF path since LLAMA_USE_PREBUILT_UI is
+# independently ON by default -- both are needed to reach
+# scripts/ui-assets.cmake's actual "no UI" fallback (an empty stub, builds
+# clean). We don't use llama-server's own UI at all (Open WebUI is the
+# actual frontend), so skip it entirely.
 RUN mkdir -p build && cd build && \
     cmake .. \
         -DGGML_CUDA=ON \
@@ -40,7 +52,9 @@ RUN mkdir -p build && cd build && \
         -DLLAMA_BUILD_TESTS=OFF \
         -DGGML_CUDA_FORCE_CUBLAS=OFF \
         -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
-        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" && \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_USE_PREBUILT_UI=OFF && \
     cmake --build . --config Release -j$(nproc)
 
 # ---------------------------------------------------------------------------

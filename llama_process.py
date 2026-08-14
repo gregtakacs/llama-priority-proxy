@@ -21,6 +21,7 @@ benchmark_vram.py's `solve` command and the live proxy's scenario-group sizing â
 small and dependency-free enough not to warrant a third module.
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -72,9 +73,19 @@ def gpu_stats(gpu_index=0):
     single nvidia-smi call rather than folded into gpu_total_bytes/gpu_used_bytes above,
     since those two are also used standalone by the scenario-sizing math (VRAM budget
     calculations that don't care about utilization/power at all); this is purely a
-    display convenience for /status."""
+    display convenience for /status.
+
+    power.limit (the currently-enforced limit) comes back [N/A] under WSL2's
+    virtualized nvidia driver -- power.draw still works there, but with no limit to
+    divide against, the dashboard's power bar has nothing to render. power.max_limit
+    (the card's hard ceiling, e.g. 175W on this laptop GPU) is queried as a fallback --
+    power.default_limit looked like the better fit at first (95W, the factory/default
+    power target) but Dynamic Boost routinely pushes draw past it (observed 122W), so
+    it isn't actually an enforced ceiling and would peg the bar at 100% under normal
+    load. max_limit is the one figure draw can never exceed."""
     result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=utilization.gpu,power.draw,power.limit",
+        ["nvidia-smi",
+         "--query-gpu=utilization.gpu,power.draw,power.limit,power.max_limit",
          "--format=csv,noheader,nounits", f"--id={gpu_index}"],
         capture_output=True, text=True, timeout=10,
     )
@@ -87,12 +98,12 @@ def gpu_stats(gpu_index=0):
         except ValueError:
             return None  # e.g. "[N/A]" -- some GPUs/drivers don't report a given metric
 
-    util, power_draw, power_limit = result.stdout.strip().splitlines()[0].split(", ")
+    util, power_draw, power_limit, power_max_limit = result.stdout.strip().splitlines()[0].split(", ")
     util_val = _num(util)
     return {
         "utilization_pct": None if util_val is None else int(util_val),
         "power_draw_w": _num(power_draw),
-        "power_limit_w": _num(power_limit),
+        "power_limit_w": _num(power_limit) or _num(power_max_limit),
     }
 
 
@@ -200,6 +211,77 @@ def wait_for_health(handle, timeout_s):
             pass
         time.sleep(1)
     return False, f"timed out after {timeout_s}s (still starting)"
+
+
+# Filler line for send_warmup_prompt's synthetic prompt -- code-shaped text,
+# not that its content matters, just its rough token density.
+_WARMUP_FILLER_LINE = (
+    "def process_item(x, y, z): return x + y * z - (x % (y+1)) if z else None  # placeholder\n"
+)
+
+
+def send_completion_prompt(handle, n_tokens, ctx=None, n_predict=16, timeout_s=180):
+    """POST a synthetic ~n_tokens-token prompt to /completion and return
+    llama.cpp's own parsed JSON response (including its `timings` block --
+    prompt_per_second, predicted_per_second, etc.) so the caller can inspect
+    real measured throughput, not just whether the request completed.
+
+    Why this exists: llama.cpp's own built-in startup warmup (run before
+    /health reports ready) was found empirically to under-allocate for large
+    real prompts -- a model benchmarked as fitting comfortably (near-zero
+    predicted headroom, but nominally fitting) measured only ~34 tok/s
+    prefill and near-zero free VRAM against an actual multi-thousand-token
+    prompt, matching a multi-GB spill into Windows' shared GPU memory. A
+    dummy request through the real /completion path, sized like real usage,
+    is a direct empirical check instead of trusting that llama.cpp's own
+    tiny warmup already covers it.
+
+    Pass the trial's own ctx so a small-ctx sample point (e.g. the "small"
+    end of bench's 2-point fit) doesn't get asked to hold a prompt bigger
+    than it has room for -- the target is capped to ctx minus room for
+    n_predict + margin.
+
+    Returns (True, response_dict) on success, or (False, reason) on failure
+    -- a failure here doesn't necessarily mean the model is broken, just
+    that this extra realism check didn't complete; the caller decides
+    whether to still fall back to a bare VRAM measurement.
+    """
+    if n_tokens <= 0:
+        return True, None
+    target = n_tokens
+    if ctx is not None:
+        target = min(n_tokens, max(0, ctx - 128))
+    if target <= 0:
+        return True, None
+    # Conservative (dense) chars-per-token assumption -- terse, symbol-heavy
+    # code tokenizes denser than plain English, so a naive ~4-chars/token
+    # guess can overshoot the real token count enough to blow past `target`
+    # and get rejected with a 400 (confirmed in practice). Undershooting the
+    # real count a bit is fine (still "big enough" for realism); overshooting
+    # past ctx is not, so bias the estimate down.
+    reps = max(1, (target * 2) // len(_WARMUP_FILLER_LINE) + 1)
+    prompt = _WARMUP_FILLER_LINE * reps
+    body = json.dumps({"prompt": prompt, "n_predict": n_predict, "cache_prompt": False}).encode()
+    url = f"http://127.0.0.1:{handle.port}/completion"
+    req = urlrequest.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+            if resp.status == 200:
+                return True, json.loads(resp.read())
+            return False, f"HTTP {resp.status}"
+    except (URLError, OSError, TimeoutError) as e:
+        return False, str(e)
+
+
+def send_warmup_prompt(handle, n_tokens, ctx=None, timeout_s=180):
+    """Thin wrapper around send_completion_prompt for bench's own
+    load-and-discard warmup use, where only success/failure matters, not
+    the response body. See send_completion_prompt for the full rationale.
+    Returns (True, None) on success, or (False, reason) on failure."""
+    ok, result = send_completion_prompt(handle, n_tokens, ctx=ctx, timeout_s=timeout_s)
+    if not ok:
+        return False, result
+    return True, None
 
 
 def _handle_alive(handle):
