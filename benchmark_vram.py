@@ -246,9 +246,16 @@ def discover_models(models_dir, options=None):
     `options` (keyed by discovered name, see config/model_options.json) can set
     parallel/min_ctx/max_ctx/extra_args/n_gpu_layers for the handful of things that
     aren't inherent to the file itself (e.g. how many parallel slots you intend to
-    run a given model with)."""
+    run a given model with).
+
+    An options entry may also set "file" to point at a DIFFERENT discovered
+    model's filename — this lets the same .gguf back multiple independently
+    configured "instances" (their own parallel/extra_args/sampling/label, own
+    VRAM registry row keyed by the instance's own name) without copying or
+    symlinking the underlying weights. See config/model_options.json's
+    _comment for the field's own docs."""
     options = options or {}
-    configs = []
+    physical = {}  # name (from filename) -> (path, info)
     for fname in sorted(os.listdir(models_dir)):
         if not fname.lower().endswith(".gguf"):
             continue
@@ -265,8 +272,26 @@ def discover_models(models_dir, options=None):
             continue
         if _is_mmproj_info(info):
             continue  # vision projector, not a launchable model — see _is_mmproj_info
+        physical[name] = (path, info)
 
+    # Every physical file gets an entry under its own name; every options
+    # entry with a "file" pointing at one of those physical names gets an
+    # additional entry under ITS OWN (alias) name, reusing that file's path
+    # and GGUF metadata. Sorted so iteration order stays deterministic
+    # (physical names are already sorted; aliases appended after, also sorted).
+    alias_names = sorted(n for n, opt in options.items() if "file" in opt and n not in physical)
+    all_names = list(physical.keys()) + alias_names
+
+    configs = []
+    for name in all_names:
         opt = options.get(name, {})
+        target = opt.get("file", name)
+        target_entry = physical.get(target)
+        if target_entry is None:
+            print(f"[warn] '{name}': \"file\": \"{target}\" does not match any discovered "
+                  f"model in {models_dir} — skipping")
+            continue
+        path, info = target_entry
         max_ctx = opt.get("max_ctx") or info["context_length"] or DEFAULT_MAX_CTX
         if info["context_length"] is None:
             print(f"[warn] '{name}': no context_length in GGUF metadata — "
@@ -999,6 +1024,19 @@ _BENCH_OPTIONS_COMMENT = [
     "touches/overwrites values you've already edited here.",
     "",
     "Fields (all optional except parallel):",
+    "  file         (optional)    point this entry at a DIFFERENT entry's own key",
+    "                             (which must itself resolve, directly or via its own",
+    "                             \"file\", to a real discovered filename) instead of a",
+    "                             filename discovered on disk. Lets one .gguf back",
+    "                             several independently configured \"instances\" -- own",
+    "                             parallel/extra_args/sampling/label/max_ctx, own VRAM",
+    "                             registry row keyed by THIS entry's key -- without",
+    "                             copying or symlinking the weights. inspect never",
+    "                             writes or touches entries that use this field; add",
+    "                             them by hand. Example: a model you want to serve",
+    "                             once tuned for coding (tight temp, -ctk/-ctv q4_0)",
+    "                             and again for chat (default temp, -ctk/-ctv q8_0) --",
+    "                             two entries, same \"file\", different everything else.",
     "  parallel     (default 1)   how many concurrent slots to benchmark this model with.",
     "                             This is the one you'll most likely change: bump it to",
     "                             match how many parallel requests you actually intend to",

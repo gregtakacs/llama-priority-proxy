@@ -113,8 +113,38 @@
   th { text-align: left; padding: 8px 10px; color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; border-bottom: 1px solid var(--border); }
   td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
   tr:last-child td { border-bottom: none; }
-  .model-name { font-weight: 600; }
-  .model-name small { display: block; color: var(--text-dim); font-weight: 400; font-size: 0.75rem; }
+  .model-name { font-weight: 600; position: relative; }
+  .model-name-trigger { cursor: help; border-bottom: 1px dotted var(--text-dim); }
+  .model-underlying { color: var(--text-dim); font-weight: 400; font-size: 0.8rem; }
+  .model-tooltip {
+    visibility: hidden; opacity: 0; pointer-events: none;
+    position: absolute; left: 0; top: 100%; margin-top: 0; padding-top: 8px;
+    z-index: 30;
+    transition: opacity 0.1s ease;
+  }
+  .model-tooltip-box {
+    background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-weight: 400; color: var(--text-dim);
+    width: max-content; max-width: 480px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  /* .tooltip-open is toggled by JS (see attachTooltipDelegation) rather than
+     relying on raw :hover -- a bare :hover has zero tolerance for the mouse
+     leaving .model-name for an instant while crossing into the tooltip below
+     it, which made a scrollable args list (the whole point of hovering)
+     unreachable in practice. JS gives a grace period instead; :focus-within
+     stays as a pure-CSS fallback for keyboard users tabbing to the trigger. */
+  .model-name.tooltip-open .model-tooltip, .model-name:focus-within .model-tooltip { visibility: visible; opacity: 1; pointer-events: auto; }
+  .model-tooltip-row { font-size: 0.78rem; margin-bottom: 4px; }
+  .model-tooltip-row:last-child { margin-bottom: 0; }
+  .model-tooltip-heading { color: var(--text); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; margin: 8px 0 3px; }
+  .model-tooltip-heading:first-child { margin-top: 0; }
+  .model-args {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all; font-size: 0.72rem; line-height: 1.5;
+    color: var(--text); background: var(--surface); border-radius: 6px;
+    padding: 6px 8px; max-height: 240px; overflow-y: auto;
+  }
   .proc-indicators { display: inline-flex; gap: 3px; align-items: center; }
   .proc-dot { width: 10px; height: 10px; border-radius: 3px; background: var(--border); transition: background 0.2s; }
   .proc-dot.active { background: var(--accent); }
@@ -584,6 +614,71 @@ function renderScenarioModelsTable(models) {
   }
 }
 
+// Groups a flat llama-server argv into one "--flag value" (or bare-flag)
+// per line, for a readable multi-line display -- args is just a flat token
+// list server-side (see llama_process.py's ServerHandle.args), no structure
+// to key off other than "a new flag starts a new line".
+function formatLlamaArgs(args) {
+  if (!args || !args.length) return null;
+  const lines = [];
+  let cur = [];
+  for (const tok of args) {
+    if (tok.startsWith('-') && cur.length) {
+      lines.push(cur.join(' '));
+      cur = [tok];
+    } else {
+      cur.push(tok);
+    }
+  }
+  if (cur.length) lines.push(cur.join(' '));
+  return lines.join('\n');
+}
+
+// Shared hover-tooltip body for a model row: underlying model name (if it
+// differs from the label), slot/ctx info, and -- once loaded -- the actual
+// llama-server command line it was launched with.
+function modelTooltipHtml(m) {
+  const rows = [];
+  if (m.name && m.label !== m.name) rows.push(`<div class="model-tooltip-row">model: ${m.name}</div>`);
+  if (m.slot) rows.push(`<div class="model-tooltip-row">slot: ${m.slot}</div>`);
+  const ctxHtml = (m.ctx_size != null ? fmtNum(m.ctx_size) : '—') + (m.max_ctx != null ? ` / max ${fmtNum(m.max_ctx)}` : '');
+  rows.push(`<div class="model-tooltip-row">ctx: ${ctxHtml}</div>`);
+  const argsText = formatLlamaArgs(m.llama_args);
+  rows.push(`<div class="model-tooltip-heading">llama.cpp args</div>`);
+  rows.push(argsText ? `<div class="model-args">${argsText}</div>` : `<div class="model-tooltip-row">(not loaded)</div>`);
+  return `<div class="model-tooltip" role="tooltip"><div class="model-tooltip-box">${rows.join('')}</div></div>`;
+}
+
+// Hover reveal for .model-tooltip is JS-driven (a "tooltip-open" class,
+// toggled here) rather than pure CSS :hover -- see the .model-tooltip CSS
+// comment for why. Delegated on the stable table container (not per-row
+// elements, which get replaced whenever renderScenarioModelsTable/
+// renderModelsTable rebuild rows) so it keeps working across polling
+// refreshes without needing to re-attach listeners every render.
+function attachTooltipDelegation(containerId) {
+  const container = document.getElementById(containerId);
+  let hideTimer = null;
+  container.addEventListener('mouseover', (e) => {
+    const wrap = e.target.closest('.model-name');
+    if (!wrap) return;
+    clearTimeout(hideTimer);
+    container.querySelectorAll('.model-name.tooltip-open').forEach(el => {
+      if (el !== wrap) el.classList.remove('tooltip-open');
+    });
+    wrap.classList.add('tooltip-open');
+  });
+  container.addEventListener('mouseout', (e) => {
+    const wrap = e.target.closest('.model-name');
+    if (!wrap || wrap.contains(e.relatedTarget)) return;
+    // Grace period before actually hiding -- gives the mouse room to travel
+    // from the label down into the tooltip (or back) without the tooltip
+    // vanishing mid-transit, which was the original bug.
+    hideTimer = setTimeout(() => wrap.classList.remove('tooltip-open'), 350);
+  });
+}
+attachTooltipDelegation('modelsTable');
+attachTooltipDelegation('standaloneModels');
+
 function scenarioModelRowHtml(m) {
   const slotCache = window.modelSlotCache || {};
   const slotInfo = slotCache[m.port] || { slots: 0, running: 0, loaded: false };
@@ -597,7 +692,7 @@ function scenarioModelRowHtml(m) {
   const action = m.loaded ? 'evict' : 'load';
   const actionLabel = m.loaded ? 'Evict' : 'Load';
   return `<tr data-model="${m.name}" data-loaded="${m.loaded}">
-    <td class="model-name">${m.label}<small>${m.slot} · ctx ${m.ctx_size != null ? fmtNum(m.ctx_size) : '—'}</small></td>
+    <td class="model-name"><span class="model-name-trigger" tabindex="0">${m.label}</span>${modelTooltipHtml(m)}</td>
     <td>${m.port}</td>
     <td class="status-cell">${statusHtml}</td>
     <td class="proc-cell" data-port="${m.port}"><div class="proc-indicators">${indicators}<span class="proc-label">${procLabel}</span></div></td>
@@ -656,7 +751,7 @@ function renderModelsTable(models, containerId, cacheKey) {
                       ![...currentModels].every(k => newModels.has(k));
 
   if (needRebuild) {
-    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Context</th><th>Processes</th><th>Idle</th><th>Evicts</th></tr></thead><tbody>`;
+    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Processes</th><th>Idle</th><th>Evicts</th></tr></thead><tbody>`;
     for (const m of models) {
       const slotInfo = slotCache[m.port] || { slots: 0, running: 0, loaded: false };
       const numDots = slotInfo.slots || 1;
@@ -666,9 +761,8 @@ function renderModelsTable(models, containerId, cacheKey) {
       }).join('');
       const procLabel = slotInfo.loaded ? `${slotInfo.running}/${slotInfo.slots}` : 'loading...';
       html += `<tr data-model="${m.name}|${m.port}">
-        <td class="model-name">${m.name}<small>ctx ${fmtNum(m.ctx_size)}</small></td>
+        <td class="model-name"><span class="model-name-trigger" tabindex="0">${m.label || m.name}</span>${modelTooltipHtml(m)}</td>
         <td>${m.port}</td>
-        <td>${fmtNum(m.ctx_size)}</td>
         <td class="proc-cell" data-port="${m.port}"><div class="proc-indicators">${indicators}<span class="proc-label">${procLabel}</span></div></td>
         <td class="idle-cell" data-idle-s="${m.idle_for_s != null ? m.idle_for_s : ''}">${m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—'}</td>
         <td class="evict-cell">${fmtEvict(m)}</td>

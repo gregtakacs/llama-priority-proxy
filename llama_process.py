@@ -110,9 +110,15 @@ def gpu_stats(gpu_index=0):
 class ServerHandle:
     """kind='native': proc + log_path are set. kind='docker': container_name is
     set (None if `docker run` itself failed to even start, in which case
-    docker_launch_error holds its stderr)."""
+    docker_launch_error holds its stderr).
+
+    `args`: the actual llama-server argv this instance was launched with
+    (including --model), regardless of backend -- for "docker" this is the
+    args passed to the llama-server entrypoint INSIDE the container, not the
+    `docker run ...` wrapper around it, since that wrapper is plumbing the
+    caller (e.g. the dashboard) doesn't actually care about."""
     def __init__(self, kind, port, proc=None, log_path=None,
-                 container_name=None, docker_launch_error=None, gpu_index=0):
+                 container_name=None, docker_launch_error=None, gpu_index=0, args=None):
         self.kind = kind
         self.port = port
         self.proc = proc
@@ -120,6 +126,7 @@ class ServerHandle:
         self.container_name = container_name
         self.docker_launch_error = docker_launch_error
         self.gpu_index = gpu_index
+        self.args = args or []
 
 
 def launch_server(model_path, ctx, parallel, port, n_gpu_layers=99, extra_args=None, backend=None):
@@ -135,13 +142,14 @@ def launch_server(model_path, ctx, parallel, port, n_gpu_layers=99, extra_args=N
         os.makedirs(LOG_DIR, exist_ok=True)
         log_path = os.path.join(LOG_DIR, f"{os.path.basename(model_path)}_ctx{ctx}_p{parallel}.log")
         proc = subprocess.Popen(args, stdout=open(log_path, "w"), stderr=subprocess.STDOUT)
-        return ServerHandle("native", port, proc=proc, log_path=log_path)
+        return ServerHandle("native", port, proc=proc, log_path=log_path, args=args)
 
     # docker backend: model_path is a HOST path (as discovered from --models-dir);
     # translate it to the in-container mount path.
     container_name = f"llama-bench-{os.getpid()}-{int(time.time() * 1000) % 1_000_000}"
     gpu_flag = "all" if backend["gpu_index"] == 0 else f"device={backend['gpu_index']}"
     container_model_path = f"/models/{os.path.basename(model_path)}"
+    llama_server_args = ["--model", container_model_path] + llama_args
     cmd = [
         "docker", "run", "-d",
         "--gpus", gpu_flag,
@@ -150,13 +158,13 @@ def launch_server(model_path, ctx, parallel, port, n_gpu_layers=99, extra_args=N
         "--entrypoint", "llama-server",
         "-v", f"{backend['models_dir']}:/models:ro",
         backend["image"],
-        "--model", container_model_path,
-    ] + llama_args
+    ] + llama_server_args
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return ServerHandle("docker", port, docker_launch_error=result.stderr.strip(),
-                             gpu_index=backend["gpu_index"])
-    return ServerHandle("docker", port, container_name=container_name, gpu_index=backend["gpu_index"])
+                             gpu_index=backend["gpu_index"], args=llama_server_args)
+    return ServerHandle("docker", port, container_name=container_name, gpu_index=backend["gpu_index"],
+                         args=llama_server_args)
 
 
 def _docker_inspect(container_name, fmt):

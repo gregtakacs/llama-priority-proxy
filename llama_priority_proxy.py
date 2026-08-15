@@ -358,7 +358,7 @@ def sampling_args(opt):
 
 async def spawn_model(state, name, port, ctx, load_timeout_s):
     opt = state.options.get(name, {})
-    path = os.path.join(state.models_dir, f"{name}.gguf")
+    path = os.path.join(state.models_dir, f"{opt.get('file', name)}.gguf")
     parallel = opt.get("parallel", 1)
     loop = asyncio.get_event_loop()
 
@@ -1161,21 +1161,30 @@ async def handle_status(request):
                               else round(max(0.0, parse_keep_alive(keep_alive) - (now - lm.last_used)), 1))
             scenario_models.append({
                 "name": m["name"],
-                "label": m.get("label", m["name"]),
+                "label": model_label(m["name"], state.options, m.get("label")),
                 "slot": m.get("slot", "primary"),
                 "port": port,
+                "max_ctx": state.options.get(m["name"], {}).get("max_ctx"),
                 "ctx_size": state.reserved_ctx.get(m["name"]),
                 "loaded": lm is not None,
                 "keep_alive": keep_alive,
                 "idle_for_s": idle_for_s,
                 "evict_in_s": evict_in_s,
+                "llama_args": None if lm is None else lm.handle.args,
             })
     return web.json_response({
         "active_scenario": state.active_scenario,
         "pinned_scenario": state.pinned_scenario,
         "scenario_models": scenario_models,
         "standalone_models": [
-            {"name": lm.name, "port": lm.port, "ctx_size": lm.ctx_size}
+            {
+                "name": lm.name,
+                "label": model_label(lm.name, state.options),
+                "port": lm.port,
+                "max_ctx": state.options.get(lm.name, {}).get("max_ctx"),
+                "ctx_size": lm.ctx_size,
+                "llama_args": lm.handle.args,
+            }
             for lm in state.standalone_loaded.values()
         ],
         "gpu": {
