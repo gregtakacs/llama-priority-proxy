@@ -82,6 +82,38 @@
       "measured_at": "2026-07-05T00:55:49"
     },
     {
+      "name": "Qwen3.8-27B-UD-Q4_K_XL",
+      "parallel_tested": 4,
+      "max_ctx": 262144,
+      "base_vram_bytes": 19769851904,
+      "bytes_per_ctx_token": 66560.0,
+      "config_signature": {
+        "parallel": 4,
+        "max_ctx": 262144,
+        "min_ctx": null,
+        "n_gpu_layers": 99,
+        "extra_args": [
+          "--mmproj",
+          "/models/Qwen3.8-27B-UD-Q4_K_XL.mmproj-BF16.gguf"
+        ]
+      },
+      "warmup_prompt_tokens": 3072,
+      "measurement_may_be_capped": false,
+      "samples": [
+        {
+          "ctx": 4096,
+          "vram_bytes": 20042481664,
+          "near_ceiling": false
+        },
+        {
+          "ctx": 131072,
+          "vram_bytes": 28494004224,
+          "near_ceiling": false
+        }
+      ],
+      "measured_at": "2026-08-14T19:21:09"
+    },
+    {
       "name": "nomic-embed-text",
       "parallel_tested": 1,
       "max_ctx": 2048,

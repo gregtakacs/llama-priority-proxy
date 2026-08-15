@@ -90,6 +90,23 @@
       "presence_penalty": 1.0,
       "max_ctx": 262144
     },
+    "Qwen3.8-27B-UD-Q4_K_XL": {
+      "parallel": 4,
+      "label": "TakacsAI-Coder",
+      "keep_alive": "20m",
+      "extra_args": [
+        "--mmproj",
+        "/models/Qwen3.8-27B-UD-Q4_K_XL.mmproj-BF16.gguf"
+      ],
+      "_sampling_comment": "Official Qwen3.8 thinking-mode recommended set (HF model card): temp=1.0, top_p=0.95, top_k=20, min_p=0, presence_penalty=0, repetition_penalty=1 — this model runs in its default thinking mode (no disable flag). If repeat loops appear on this quantized build, Qwen's guidance is to raise presence_penalty within 0-2 rather than adding a repeat penalty (higher values may cause language mixing).",
+      "temp": 1.0,
+      "top_k": 20,
+      "top_p": 0.95,
+      "min_p": 0,
+      "repeat_penalty": 1.0,
+      "presence_penalty": 0.0,
+      "max_ctx": 262144
+    },
     "nomic-embed-text": {
       "parallel": 1,
       "label": "nomic-embed-text",
@@ -101,7 +118,7 @@
     },
     "ornith-35b": {
       "parallel": 4,
-      "label": "TakacsAI-Coder",
+      "label": "ornith-35b",
       "keep_alive": "20m",
       "_sampling_comment": "Same qwen35moe arch as the chat model, but tuned tighter for coding correctness: lower temp, same anti-repeat-loop presence_penalty.",
       "temp": 0.3,
