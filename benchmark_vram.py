@@ -401,9 +401,55 @@ def wait_for_baseline_clear(baseline_bytes, gpu_index, tolerance_mb=200, max_wai
 # Measurement
 # ---------------------------------------------------------------------------
 
+# How close a "settled" reading can get to the card's total physical VRAM
+# before it's flagged as untrustworthy -- see _warn_if_near_ceiling's
+# docstring for why a near-ceiling reading is actively misleading, not just
+# imprecise.
+NEAR_CEILING_MARGIN_FRAC = 0.05
+
+
+def _warn_if_near_ceiling(vram_bytes, gpu_index):
+    """A 'settled' VRAM reading close to the card's total physical capacity
+    isn't a real measurement of what the model needs -- it's the ceiling
+    nvidia-smi is physically capable of reporting. `nvidia-smi`'s
+    memory.used only ever reports DEDICATED VRAM; on Windows/WSL2, when a
+    config's true requirement exceeds the physical card, the driver
+    silently backs the overflow with system RAM (WDDM's "shared GPU
+    memory") instead of erroring -- invisible to nvidia-smi entirely, and
+    catastrophically slower (confirmed: ~34 tok/s prefill vs. 1000+ normal).
+
+    Caught concretely in this project's own history: at ctx=262,144, bench
+    repeatedly measured ~23.2GB (suspiciously close to this card's ~23.9GB
+    total) while every OTHER sample point at smaller ctx agreed tightly on a
+    consistent 65.00 KB/token slope that, extrapolated to 262,144, predicts
+    ~29-30GB -- a 6-7GB gap matching almost exactly the shared-memory
+    spillover Windows Task Manager reported when a config fit from that
+    262,144 sample was trusted and failed live. The 262,144 reading wasn't
+    noise; it was truncated at the physical ceiling with no signal that
+    anything was wrong.
+
+    Returns True if `vram_bytes` is within NEAR_CEILING_MARGIN_FRAC of the
+    card's total (and prints a loud warning); False otherwise."""
+    total = gpu_total_bytes(gpu_index)
+    if total is None:
+        return False
+    threshold = total * (1 - NEAR_CEILING_MARGIN_FRAC)
+    if vram_bytes < threshold:
+        return False
+    print(f"    [WARN] settled reading {format_bytes(vram_bytes)} is within "
+          f"{NEAR_CEILING_MARGIN_FRAC*100:.0f}% of this card's total VRAM ({format_bytes(total)}) "
+          f"-- likely TRUNCATED, not a real measurement. The true requirement may be several GB "
+          f"higher, silently spilling into system-backed shared GPU memory (invisible to "
+          f"nvidia-smi, catastrophically slow). Do not trust this sample point; prefer a smaller "
+          f"max_ctx that measures comfortably below the physical ceiling.")
+    return True
+
+
 def measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens=0):
     """Launch llama-server at a given ctx, measure settled VRAM, tear down.
-    Returns vram_bytes on success, or None if the server OOM'd / failed to start."""
+    Returns (vram_bytes, near_ceiling: bool) on success, or (None, False) if
+    the server OOM'd / failed to start. near_ceiling True means don't trust
+    vram_bytes as the model's true requirement -- see _warn_if_near_ceiling."""
     extra_args = model_cfg.get("extra_args", [])
     n_gpu_layers = model_cfg.get("n_gpu_layers", 99)
     parallel = model_cfg["parallel"]
@@ -416,12 +462,12 @@ def measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend, warm
         if not ok:
             print(f"    ✗ failed to become healthy: {reason}")
             print_log_tail(handle)
-            return None
+            return None, False
         pid = handle_pid(handle)
         if pid is None:
             print("    ✗ could not resolve a PID for VRAM measurement")
             print_log_tail(handle)
-            return None
+            return None, False
         if warmup_prompt_tokens > 0:
             print(f"    sending ~{warmup_prompt_tokens:,}-token warmup prompt "
                   f"(exercises real compute buffers, not just llama.cpp's own tiny startup warmup) ...")
@@ -438,11 +484,11 @@ def measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend, warm
             if vram is None:
                 print("    ✗ could not read per-process OR aggregate VRAM from nvidia-smi")
                 print_log_tail(handle)
-                return None
+                return None, False
             print(f"    ✓ settled at {format_bytes(vram)} (aggregate-diff fallback)")
-            return vram
+            return vram, _warn_if_near_ceiling(vram, gpu_index)
         print(f"    ✓ settled at {format_bytes(vram)}")
-        return vram
+        return vram, _warn_if_near_ceiling(vram, gpu_index)
     finally:
         shutdown_server(handle)
         if pre_launch_baseline is not None:
@@ -506,11 +552,11 @@ def benchmark_model(model_cfg, port, gpu_index, load_timeout_s, backend, warmup_
     print(f"\n{'#'*60}\n# Benchmarking: {name}\n{'#'*60}")
 
     candidates = pick_sample_ctxs(model_cfg)
-    points = []
+    points = []  # (ctx, vram_bytes, near_ceiling)
     for ctx in candidates:
-        vram = measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens)
+        vram, near_ceiling = measure_point(model_cfg, ctx, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens)
         if vram is not None:
-            points.append((ctx, vram))
+            points.append((ctx, vram, near_ceiling))
             continue
         # OOM'd — bisect downward using the fallback ladder until we recover
         # a usable point, so a model with a too-ambitious min_ctx/max_ctx still
@@ -519,17 +565,19 @@ def benchmark_model(model_cfg, port, gpu_index, load_timeout_s, backend, warmup_
             if fb >= ctx:
                 continue
             print(f"    retrying at fallback ctx={fb:,}")
-            vram = measure_point(model_cfg, fb, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens)
+            vram, near_ceiling = measure_point(model_cfg, fb, port, gpu_index, load_timeout_s, backend, warmup_prompt_tokens)
             if vram is not None:
-                points.append((fb, vram))
+                points.append((fb, vram, near_ceiling))
                 break
 
     if len(points) < 2:
         print(f"  ✗ Only got {len(points)} usable point(s) — cannot fit a line. Skipping '{name}'.")
         return None
 
-    slope, intercept = linear_fit(points)
-    print(f"  ✓ fit: base={format_bytes(intercept)}  +{format_bytes(slope)}/token")
+    slope, intercept = linear_fit([(ctx, vram) for ctx, vram, _ in points])
+    any_near_ceiling = any(near_ceiling for _, _, near_ceiling in points)
+    print(f"  ✓ fit: base={format_bytes(intercept)}  +{format_bytes(slope)}/token"
+          f"{'  [UNRELIABLE -- see near-ceiling warning above]' if any_near_ceiling else ''}")
     return {
         "name": name,
         "parallel_tested": model_cfg["parallel"],
@@ -538,7 +586,8 @@ def benchmark_model(model_cfg, port, gpu_index, load_timeout_s, backend, warmup_
         "bytes_per_ctx_token": slope,
         "config_signature": config_signature(model_cfg),
         "warmup_prompt_tokens": warmup_prompt_tokens,
-        "samples": [{"ctx": c, "vram_bytes": v} for c, v in points],
+        "measurement_may_be_capped": any_near_ceiling,
+        "samples": [{"ctx": c, "vram_bytes": v, "near_ceiling": nc} for c, v, nc in points],
         "measured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
@@ -563,9 +612,15 @@ def load_registry(path):
     try:
         with open(path) as f:
             data = json.load(f)
-        return data if "models" in data else {"models": []}
+        data = data if "models" in data else {"models": []}
     except (FileNotFoundError, json.JSONDecodeError):
         return {"models": []}
+    capped = [m["name"] for m in data["models"] if m.get("measurement_may_be_capped")]
+    if capped:
+        print(f"[WARN] registry has {len(capped)} model(s) whose measurement may be truncated by "
+              f"the physical VRAM ceiling (see _warn_if_near_ceiling) -- don't trust these for "
+              f"'auto' sizing without re-benching at a smaller max_ctx: {', '.join(capped)}")
+    return data
 
 
 def save_registry(data, path):
