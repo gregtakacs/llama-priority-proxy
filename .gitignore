@@ -35,3 +35,8 @@ Thumbs.db
 # Test artifacts
 test-results/
 *.trace.json
+
+# compose-version-audit's own pre-edit backups of config/Dockerfile/
+# requirements files it touches (Dockerfile.*.bak-<timestamp>, etc.) --
+# local safety net, never meant to be committed.
+*.bak-*

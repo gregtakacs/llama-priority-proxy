@@ -10,7 +10,7 @@
 # mutable tag that NVIDIA republishes; without the digest a rebuild can pull a
 # new image and invalidate every layer after FROM, forcing a full CUDA
 # recompile even though LLAMA_CPP_COMMIT below never changed.
-FROM nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97 AS builder
+FROM nvidia/cuda:13.3.1-devel-ubuntu22.04@sha256:c13e01184a7fb2a90814153fdff2250f08312377887d2673cf5bc769876a37f3 AS builder
 
 ARG CMAKE_CUDA_ARCHITECTURES="120a"
 
@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build/llama.cpp
 
 # Clone a pinned commit of llama.cpp — b9871
-ARG LLAMA_CPP_COMMIT=ef2d770117db45b05aa7ecd1b0acca36370c5470
+ARG LLAMA_CPP_COMMIT=0d9ceae1e38291035605613ab41a8f5e693d6fcd
 RUN git clone https://github.com/ggml-org/llama.cpp.git . && \
     git checkout ${LLAMA_CPP_COMMIT}
 
@@ -60,7 +60,7 @@ RUN mkdir -p build && cd build && \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
 # ---------------------------------------------------------------------------
-FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04@sha256:4a801ef9232d2b05e69df4eb8aa054dbbe2824e5499e1e6e857320bb01ac41a9 AS runtime
+FROM nvidia/cuda:13.3.1-runtime-ubuntu22.04@sha256:6c8e1c94bd76b9a19f5713388da6ef290a734bcc6e96757e8b5b3f32dba9a904 AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/ggml-org/llama.cpp"
 LABEL org.opencontainers.image.description="llama.cpp server with CUDA support for RTX 5090 (Blackwell)"
