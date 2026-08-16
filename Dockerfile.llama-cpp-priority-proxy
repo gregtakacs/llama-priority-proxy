@@ -42,6 +42,19 @@ RUN git clone https://github.com/ggml-org/llama.cpp.git . && \
 # scripts/ui-assets.cmake's actual "no UI" fallback (an empty stub, builds
 # clean). We don't use llama-server's own UI at all (Open WebUI is the
 # actual frontend), so skip it entirely.
+# GGML_CUDA_FA_ALL_QUANTS=ON: without this, ggml-cuda/fattn.cu's
+# ggml_cuda_get_best_fattn_kernel() explicitly refuses any flash-attention
+# call where K->type != V->type (see its `#ifndef GGML_CUDA_FA_ALL_QUANTS`
+# guard) -- returns BEST_FATTN_KERNEL_NONE, and GGML's backend scheduler
+# then silently routes that op through the CPU backend instead, per layer,
+# per token. A mixed KV cache quant pair (e.g. --cache-type-k q8_0
+# --cache-type-v q4_0) is exactly this case. Invisible at short context
+# (tiny CPU-copy penalty); catastrophic once real conversations reach a
+# few thousand tokens (confirmed empirically: 12.6x slower prompt eval,
+# 3.8x slower decode on an identical ~6500-token prompt vs f16 KV cache,
+# which doesn't hit this path). Costs meaningfully longer compile time
+# (many more kernel template instantiations) -- worth it to actually use
+# quantized KV cache safely instead of unknowingly falling back to CPU.
 RUN mkdir -p build && cd build && \
     cmake .. \
         -DGGML_CUDA=ON \
@@ -51,6 +64,7 @@ RUN mkdir -p build && cd build && \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_TESTS=OFF \
         -DGGML_CUDA_FORCE_CUBLAS=OFF \
+        -DGGML_CUDA_FA_ALL_QUANTS=ON \
         -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
         -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" \
         -DLLAMA_BUILD_UI=OFF \
