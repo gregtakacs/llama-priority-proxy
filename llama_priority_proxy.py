@@ -37,6 +37,7 @@ import json
 import os
 import re
 import time
+from collections import deque
 
 import aiohttp
 from aiohttp import web
@@ -54,9 +55,14 @@ IDLE_SWEEP_INTERVAL_S = 10
 DEFAULT_EVICT_DRAIN_TIMEOUT_S = 40  # see drain_in_flight_before_evict -- ~8k tokens at 200 tok/s
 USER_KEYS_REGISTER_COOLDOWN_S = 4  # global rate limit between /register POSTs, see handle_register_submit
 USER_KEYS_REVALIDATE_INTERVAL_S = 24 * 3600  # see user_keys_revalidation_sweep
+METRICS_SAMPLE_INTERVAL_S = 2  # cadence for the dashboard's time-series history, see metrics_sampler
+METRICS_HISTORY_S = 600        # 10 minutes of history kept per metric
+METRICS_HISTORY_LEN = METRICS_HISTORY_S // METRICS_SAMPLE_INTERVAL_S
+TOK_S_GRACE_S = 6  # hold the last real tg_3s reading this long between llama.cpp's own ~3s print_timing ticks
 
 _KEEP_ALIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)(s|m|h)$")
 _KEEP_ALIVE_UNITS = {"s": 1, "m": 60, "h": 3600}
+_TOK_S_RE = re.compile(r"tg_3s\s*=\s*([\d.]+) t/s")
 
 
 def parse_keep_alive(raw):
@@ -325,6 +331,12 @@ class ProxyState:
         self.user_keys_lock = asyncio.Lock()  # serializes read-modify-write of user_keys + its on-disk file
         self.last_register_attempt = None     # monotonic timestamp, for /register's global rate limit
         self.user_keys_sweep_task = None      # background user_keys_revalidation_sweep task
+        self.metrics_history = deque(maxlen=METRICS_HISTORY_LEN)  # see metrics_sampler
+        self.metrics_sweep_task = None        # background metrics_sampler task
+        self._log_offsets = {}   # model name -> last-scanned byte offset in its llama-server log (tok/s sampling)
+        self._tok_s_last = {}    # model name -> (last real tg_3s value, monotonic ts), for TOK_S_GRACE_S hold
+        self._cpu_ticks = {}     # model name -> (prev utime+stime jiffies, monotonic ts), for CPU% deltas
+        self._live_mtp = {}      # model name -> {"accepted","generated"}, updated live by forward() as requests stream
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +781,133 @@ async def idle_eviction_sweep(state):
 
 
 # ---------------------------------------------------------------------------
+# Metrics history — background sampling for the dashboard's time-series
+# charts (GPU mem/power, per-model CPU%/tok-s). Runs on its own fixed
+# cadence rather than piggybacking on /status polls, so the buffer keeps
+# filling at a steady rate no matter how often (or rarely) anyone has the
+# dashboard open, and multiple simultaneous viewers all see the same history.
+# ---------------------------------------------------------------------------
+
+_CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def _read_proc_cpu_ticks(pid):
+    """utime+stime (jiffies) for `pid` from /proc, or None if it's gone.
+    comm (field 2) is parenthesized and can itself contain spaces/parens, so
+    skip past it via the last ')' rather than a naive space-split."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    rest = data[data.rfind(")") + 2:].split()
+    try:
+        return int(rest[11]) + int(rest[12])  # fields 14 (utime) + 15 (stime)
+    except (IndexError, ValueError):
+        return None
+
+
+def _sample_cpu_pct(state, name, pid, now):
+    """%CPU since the previous sample, `top`-style (100% == one core fully
+    busy, so a multi-threaded llama-server can read >100%). None on the
+    first sample for a given model (nothing to diff against yet) or once
+    /proc/<pid> is gone."""
+    ticks = _read_proc_cpu_ticks(pid)
+    prev = state._cpu_ticks.get(name)
+    state._cpu_ticks[name] = None if ticks is None else (ticks, now)
+    if ticks is None or prev is None:
+        return None
+    prev_ticks, prev_time = prev
+    dt = now - prev_time
+    if dt <= 0:
+        return None
+    return round((ticks - prev_ticks) / _CLK_TCK / dt * 100, 1)
+
+
+def _read_new_log_text(state, name, log_path):
+    """Text appended to this model's per-request timing log since the last
+    call for it, for the tok/s extractor below (MTP acceptance is sourced
+    live from the actual request/response path instead -- see
+    _record_live_mtp/state._live_mtp). Returns None if the log can't be
+    read right now (model not actually up yet)."""
+    try:
+        size = os.path.getsize(log_path)
+    except OSError:
+        return None
+    # Default to 0, not `size` -- launch_server always opens this file with
+    # "w" (truncate), so byte 0 is always the start of THIS spawn's log, never
+    # stale history from a previous run. Defaulting to `size` here used to
+    # silently skip a fast completion's whole timing block (including its
+    # tg_3s/draft-acceptance lines) whenever it finished within the same
+    # ~METRICS_SAMPLE_INTERVAL_S window as the model's on-demand spawn, since
+    # that content looked like "pre-existing" by the time the first sample
+    # for this model ran.
+    start = state._log_offsets.get(name, 0)
+    if size < start:  # log truncated/replaced (re-spawned) -- rescan from 0
+        start = 0
+    with open(log_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read()
+    state._log_offsets[name] = size
+    return chunk.decode("utf-8", errors="ignore")
+
+
+def _extract_tok_s(state, name, now, new_text):
+    """Most recent tg_3s (trailing-3s decode rate) among newly-appended log
+    text. Holds the last real reading for TOK_S_GRACE_S so the chart doesn't
+    dip to 0 between llama.cpp's own ~3s print_timing cadence; returns 0.0
+    (not None) once that grace period lapses with nothing new -- "not
+    generating" is a real zero-valued sample, same as cpu_pct's idle
+    reading, not a gap, so the history chart's x-axis stays aligned with
+    the other metrics instead of the tok/s line stopping short while
+    mem/power/cpu keep advancing."""
+    matches = _TOK_S_RE.findall(new_text)
+    if matches:
+        val = float(matches[-1])
+        state._tok_s_last[name] = (val, now)
+        return val
+    last = state._tok_s_last.get(name)
+    if last is not None and (now - last[1]) < TOK_S_GRACE_S:
+        return last[0]
+    return 0.0
+
+
+async def metrics_sampler(state):
+    """Background task: samples GPU mem/util/power plus per-model CPU%/
+    tok-s every METRICS_SAMPLE_INTERVAL_S and appends to
+    state.metrics_history. MTP acceptance is NOT sampled here -- it's
+    updated live, per-chunk, by forward() itself as real requests stream
+    through (see state._live_mtp); this loop just reads whatever forward()
+    last wrote, same as it reads whatever _extract_tok_s last computed."""
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(METRICS_SAMPLE_INTERVAL_S)
+        now = time.monotonic()
+        gpu_used = await loop.run_in_executor(None, gpu_used_bytes, state.gpu_index)
+        gpu_extra = await loop.run_in_executor(None, gpu_stats, state.gpu_index)
+        models = {}
+        for lm in list(state.loaded.values()) + list(state.standalone_loaded.values()):
+            pid = lm.handle.proc.pid if lm.handle.kind == "native" and lm.handle.proc else None
+            new_text = _read_new_log_text(state, lm.name, lm.handle.log_path) if lm.handle.log_path else None
+            mtp = state._live_mtp.get(lm.name)
+            mtp_generated = mtp["generated"] if mtp else 0
+            models[lm.name] = {
+                "cpu_pct": _sample_cpu_pct(state, lm.name, pid, now) if pid else None,
+                "tok_s": _extract_tok_s(state, lm.name, now, new_text) if new_text is not None else None,
+                "mtp_accept_pct": round(mtp["accepted"] / mtp_generated * 100, 1) if mtp_generated else None,
+                "mtp_accepted": mtp["accepted"] if mtp else None,
+                "mtp_generated": mtp_generated if mtp else None,
+            }
+        state.metrics_history.append({
+            "t": time.time(),
+            "gpu_mem_used": gpu_used,
+            "gpu_util_pct": gpu_extra["utilization_pct"],
+            "gpu_power_w": gpu_extra["power_draw_w"],
+            "models": models,
+        })
+
+
+# ---------------------------------------------------------------------------
 # Capacity queuing — llama-server's own GET /slots?fail_on_no_slot=1 is a
 # purpose-built pre-check (200 = a slot is free, 503 = full) rather than
 # something we need to infer from is_processing counts ourselves. --no-
@@ -810,9 +949,46 @@ async def wait_for_capacity(request, state, port, heartbeat_response, max_wait_s
 # the client actually asked for, so aliasing (phase 3) is invisible to it.
 # ---------------------------------------------------------------------------
 
+def _record_live_mtp(state, name, timings, reset):
+    """Feeds a request's MTP draft stats into state._live_mtp as real
+    traffic flows through forward() -- this is the ACTUAL request/response
+    path, not a side-channel log scrape, so it's as fresh as the traffic
+    itself (per-chunk on a streaming response, essentially every decode
+    step) rather than only once at task completion. `reset=True` starts a
+    fresh running total (the first chunk of a new streaming response, or
+    a non-streaming response which arrives as one already-final total);
+    `reset=False` accumulates onto the request already in flight. Absent
+    or draft-less timings (embedding models, non-MTP models) leave
+    state._live_mtp untouched, matching the "None means never seen one"
+    semantics used elsewhere (e.g. nomic-embed shows '--'). Returns True
+    if it actually recorded something -- the caller needs this to know
+    when `reset` should next fire, since a streaming response's first one
+    or two chunks (role announcement, first prompt-only timing) typically
+    carry no draft_n at all; treating THOSE as "the reset chunk" would
+    leave the real first draft-bearing chunk of a NEW request wrongly
+    accumulating onto the previous request's already-finished total."""
+    if not timings or "draft_n" not in timings:
+        return False
+    prev = None if reset else state._live_mtp.get(name)
+    base_accepted = prev["accepted"] if prev else 0
+    base_generated = prev["generated"] if prev else 0
+    state._live_mtp[name] = {
+        "accepted": base_accepted + timings.get("draft_n_accepted", 0),
+        "generated": base_generated + timings.get("draft_n", 0),
+    }
+    return True
+
+
 async def forward(request, state, body, port, client_label, real_name, max_wait_s):
     body["model"] = real_name
     is_stream = bool(body.get("stream"))
+    if is_stream:
+        # Per-chunk timings (draft_n/draft_n_accepted included) are opt-in on
+        # the streaming path -- a non-streaming response already includes a
+        # final cumulative `timings` block regardless, so this only matters
+        # here. Only defaults it on: an explicit client choice (Cline/Open
+        # WebUI don't send this today, but respect it if some client does).
+        body.setdefault("timings_per_token", True)
     url = f"http://127.0.0.1:{port}{request.path}"
 
     # A streaming response's status line commits to 200 the moment we
@@ -852,22 +1028,28 @@ async def forward(request, state, body, port, client_label, real_name, max_wait_
     async with state.http_session.post(url, json=body, timeout=forward_timeout) as resp:
         if not is_stream:
             data = await resp.json()
-            if isinstance(data, dict) and "model" in data:
-                data["model"] = client_label
+            if isinstance(data, dict):
+                _record_live_mtp(state, real_name, data.get("timings"), reset=True)
+                if "model" in data:
+                    data["model"] = client_label
             return web.json_response(data, status=resp.status)
 
+        is_first_draft_chunk = True  # flips False only once a chunk actually carries draft_n -- see _record_live_mtp
         async for line_bytes in resp.content:
             line = line_bytes.decode("utf-8", errors="replace")
-            if line.startswith("data: ") and real_name != client_label:
+            if line.startswith("data: "):
                 payload = line[len("data: "):].strip()
                 if payload and payload != "[DONE]":
                     try:
                         obj = json.loads(payload)
-                        if "model" in obj:
-                            obj["model"] = client_label
-                        line = f"data: {json.dumps(obj)}\n"
                     except json.JSONDecodeError:
-                        pass
+                        obj = None
+                    if obj is not None:
+                        if _record_live_mtp(state, real_name, obj.get("timings"), reset=is_first_draft_chunk):
+                            is_first_draft_chunk = False
+                        if real_name != client_label and "model" in obj:
+                            obj["model"] = client_label
+                            line = f"data: {json.dumps(obj)}\n"
             await response.write(line.encode())
         await response.write_eof()
         return response
@@ -1146,6 +1328,10 @@ async def handle_status(request):
         comfy_idle_for_s = round(now - state.comfy_queue_drained_at, 1)
         comfy_evict_in_s = round(max(0.0, state.image_cfg["revert_delay_s"]
                                      - (now - state.comfy_queue_drained_at)), 1)
+    # Current per-model cpu_pct/tok_s -- just the most recent metrics_sampler
+    # sample rather than a separate live read, so the "now" numbers shown next
+    # to each model always agree with the tail of its own history chart.
+    latest_model_metrics = state.metrics_history[-1]["models"] if state.metrics_history else {}
     scenario_models = []
     if state.active_scenario is not None:
         scenario = state.scenarios[state.active_scenario]
@@ -1171,6 +1357,11 @@ async def handle_status(request):
                 "idle_for_s": idle_for_s,
                 "evict_in_s": evict_in_s,
                 "llama_args": None if lm is None else lm.handle.args,
+                "cpu_pct": latest_model_metrics.get(m["name"], {}).get("cpu_pct"),
+                "tok_s": latest_model_metrics.get(m["name"], {}).get("tok_s"),
+                "mtp_accept_pct": latest_model_metrics.get(m["name"], {}).get("mtp_accept_pct"),
+                "mtp_accepted": latest_model_metrics.get(m["name"], {}).get("mtp_accepted"),
+                "mtp_generated": latest_model_metrics.get(m["name"], {}).get("mtp_generated"),
             })
     return web.json_response({
         "active_scenario": state.active_scenario,
@@ -1184,9 +1375,15 @@ async def handle_status(request):
                 "max_ctx": state.options.get(lm.name, {}).get("max_ctx"),
                 "ctx_size": lm.ctx_size,
                 "llama_args": lm.handle.args,
+                "cpu_pct": latest_model_metrics.get(lm.name, {}).get("cpu_pct"),
+                "tok_s": latest_model_metrics.get(lm.name, {}).get("tok_s"),
+                "mtp_accept_pct": latest_model_metrics.get(lm.name, {}).get("mtp_accept_pct"),
+                "mtp_accepted": latest_model_metrics.get(lm.name, {}).get("mtp_accepted"),
+                "mtp_generated": latest_model_metrics.get(lm.name, {}).get("mtp_generated"),
             }
             for lm in state.standalone_loaded.values()
         ],
+        "metrics_history": list(state.metrics_history),
         "gpu": {
             "total": format_bytes(gpu_total),
             "used": format_bytes(gpu_used),
@@ -1663,6 +1860,7 @@ async def on_startup(app):
     await activate_scenario(state, default_name, state.load_timeout_s)
 
     state.idle_sweep_task = asyncio.create_task(idle_eviction_sweep(state))
+    state.metrics_sweep_task = asyncio.create_task(metrics_sampler(state))
 
     # load_json tolerates a missing file (returns {} on first-ever run before anyone
     # has registered yet) — no separate "does it exist" check needed.
@@ -1673,6 +1871,7 @@ async def on_startup(app):
 async def on_cleanup(app):
     state = app["state"]
     state.idle_sweep_task.cancel()
+    state.metrics_sweep_task.cancel()
     state.user_keys_sweep_task.cancel()
     if state.comfy_revert_task is not None and not state.comfy_revert_task.done():
         state.comfy_revert_task.cancel()

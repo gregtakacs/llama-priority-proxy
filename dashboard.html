@@ -19,6 +19,11 @@
     --red: #f87171;
     --orange: #fb923c;
     --radius: 10px;
+    /* History-chart categorical series colors -- fixed order (see
+       renderHistoryCharts), never reassigned per filter/poll. */
+    --series-1: #3987e5; /* blue */
+    --series-2: #d95926; /* orange */
+    --series-3: #199e70; /* aqua */
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -109,6 +114,33 @@
   .gpu-bar { height: 100%; border-radius: 7px; transition: width 0.6s ease; background: linear-gradient(90deg, var(--green), var(--yellow)); }
   .gpu-text { margin-top: 6px; font-size: 0.85rem; color: var(--text-dim); }
   .gpu-text strong { color: var(--text); }
+
+  /* Time-series history charts */
+  .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
+  .chart-panel { min-width: 0; }
+  .chart-title-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .chart-title { font-size: 0.78rem; color: var(--text-dim); }
+  .chart-value { font-size: 0.82rem; font-weight: 600; white-space: nowrap; }
+  .chart-legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 0.72rem; color: var(--text-dim); margin: 4px 0 2px; }
+  .chart-legend-item { display: flex; align-items: center; gap: 5px; }
+  .chart-legend-swatch { width: 10px; height: 2px; border-radius: 1px; display: inline-block; }
+  .chart-svg-wrap { position: relative; margin-top: 4px; }
+  .chart-svg-wrap svg { display: block; width: 100%; height: 90px; }
+  /* Paired mini-charts (tok/s + MTP%) stacked in one panel, sharing a time
+     axis and one legend -- see the "Token/s" panel -- each shorter than a
+     standalone chart so the pair together stay compact. */
+  .chart-svg-wrap.compact svg { height: 64px; }
+  .chart-subtitle-row { margin-top: 10px; }
+  .chart-empty { color: var(--text-dim); font-size: 0.78rem; padding: 30px 0; text-align: center; }
+  .chart-tooltip {
+    position: absolute; pointer-events: none; background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 0.75rem; white-space: nowrap; display: none;
+    top: 4px; z-index: 5;  /* left is computed + clamped in JS, not CSS -- see renderTimeSeriesChart */
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  .chart-tooltip .tt-value { color: var(--text); font-weight: 600; }
+  .chart-tooltip .tt-label { color: var(--text-dim); }
   table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
   th { text-align: left; padding: 8px 10px; color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; border-bottom: 1px solid var(--border); }
   td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
@@ -263,6 +295,67 @@
   </div>
 </div>
 
+<div class="card" id="historyCard" style="margin-top:16px;display:none;">
+  <div class="card-title">History (last 10 min)</div>
+  <div class="chart-grid">
+    <div class="chart-panel">
+      <div class="chart-title-row">
+        <span class="chart-title">GPU Memory</span>
+        <span class="chart-value" id="memChartValue">—</span>
+      </div>
+      <div class="chart-svg-wrap">
+        <svg id="memChart"></svg>
+        <div class="chart-tooltip" id="memChartTooltip"></div>
+      </div>
+    </div>
+    <div class="chart-panel">
+      <div class="chart-title-row">
+        <span class="chart-title">GPU Power</span>
+        <span class="chart-value" id="powerChartValue">—</span>
+      </div>
+      <div class="chart-svg-wrap">
+        <svg id="powerChart"></svg>
+        <div class="chart-tooltip" id="powerChartTooltip"></div>
+      </div>
+    </div>
+    <div class="chart-panel">
+      <div class="chart-title-row">
+        <span class="chart-title">Utilization</span>
+        <span class="chart-value" id="cpuChartValue">—</span>
+      </div>
+      <div class="chart-legend" id="cpuChartLegend"></div>
+      <div class="chart-svg-wrap">
+        <svg id="cpuChart"></svg>
+        <div class="chart-tooltip" id="cpuChartTooltip"></div>
+      </div>
+    </div>
+    <div class="chart-panel">
+      <div class="chart-title-row">
+        <span class="chart-title">Token/s</span>
+        <span class="chart-value" id="tokChartValue"></span>
+      </div>
+      <div class="chart-legend" id="tokChartLegend"></div>
+      <div class="chart-svg-wrap compact">
+        <svg id="tokChart"></svg>
+        <div class="chart-tooltip" id="tokChartTooltip"></div>
+      </div>
+      <!-- Stacked, not overlaid on a second y-axis -- a dual-axis chart
+           makes a line-crossing look meaningful when it isn't, since the
+           two scales don't match. Same time window + same per-model colors
+           as the chart above (one shared legend covers both), so the two
+           are still easy to read together at a glance. -->
+      <div class="chart-title-row chart-subtitle-row">
+        <span class="chart-title">MTP Accept %</span>
+        <span class="chart-value" id="mtpChartValue"></span>
+      </div>
+      <div class="chart-svg-wrap compact">
+        <svg id="mtpChart"></svg>
+        <div class="chart-tooltip" id="mtpChartTooltip"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="emptyState" class="card" style="text-align:center;padding:48px 24px;display:none;">
   <div style="color:var(--text-dim);font-size:0.95rem;">Unable to connect to proxy.</div>
 </div>
@@ -379,6 +472,7 @@ async function fetchAndRender() {
     hideError();
     // Show main content on first success
     document.getElementById('mainContent').style.display = '';
+    document.getElementById('historyCard').style.display = '';
     document.getElementById('emptyState').style.display = 'none';
     renderStatus(status);
   } catch(e) {
@@ -444,6 +538,13 @@ function fmtEvict(m) {
   if (m.keep_alive === '-1') return 'pinned';
   if (m.evict_in_s == null) return '—';  // default scenario active — idle eviction doesn't apply right now
   return m.evict_in_s <= 0 ? 'due' : `in ${fmtIdle(m.evict_in_s)}`;
+}
+
+// MTP draft-acceptance % from the model's last *completed* generation --
+// None means either never generated yet, or this model doesn't run with
+// --spec-type draft-mtp at all (e.g. an embedding-only standalone model).
+function fmtMtp(m) {
+  return m.mtp_accept_pct != null ? `${m.mtp_accept_pct.toFixed(0)}%` : '—';
 }
 
 function parseByteStr(s) {
@@ -556,6 +657,409 @@ function renderStatus(data) {
   renderScenarioModelsTable(data.scenario_models || []);
   renderModelsTable(data.standalone_models || [], 'standaloneModels', 'standaloneSlotCache');
   renderScenariosList(data.scenarios || []);
+  renderHistoryCharts(data);
+}
+
+// ---- History charts (GPU mem/power + per-model CPU%/tok-s over time) ----
+// Small dependency-free inline-SVG line charts -- no chart library, matching
+// this file's existing no-CDN/vanilla-JS convention. One axis per chart
+// (never dual-axis): mem, power, cpu%, tok/s each get their own panel rather
+// than being overlaid on shared scales.
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+// Fixed categorical order (never reassigned per poll) so a given model keeps
+// the same line color across charts and across reloads.
+const SERIES_COLORS = [cssVar('--series-1'), cssVar('--series-2'), cssVar('--series-3')];
+const CHART_PAD = { top: 6, right: 4, bottom: 4, left: 4 };
+
+function renderChartLegend(legendId, series) {
+  const el = document.getElementById(legendId);
+  el.textContent = '';
+  if (series.length < 2) {  // a single series needs no legend -- the panel title already names it
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = '';
+  series.forEach(s => {
+    const item = document.createElement('span');
+    item.className = 'chart-legend-item';
+    const swatch = document.createElement('span');
+    swatch.className = 'chart-legend-swatch';
+    swatch.style.background = s.color;
+    const label = document.createElement('span');
+    label.textContent = s.name;  // textContent, not innerHTML -- model labels come from config, but treat as untrusted
+    item.appendChild(swatch);
+    item.appendChild(label);
+    el.appendChild(item);
+  });
+}
+
+// Live "now" readout for a multi-series chart's title row -- mirrors what
+// memChartValue/powerChartValue already show for their single series, just
+// one colored dot + value per series instead of one bare number.
+function renderChartValueSummary(elId, series, formatValue) {
+  const el = document.getElementById(elId);
+  el.textContent = '';
+  const withData = series.filter(s => s.points.length);
+  if (!withData.length) {
+    el.textContent = '—';
+    return;
+  }
+  withData.forEach((s, i) => {
+    if (i > 0) el.appendChild(document.createTextNode('  '));
+    const dot = document.createElement('span');
+    dot.style.cssText = `display:inline-block;width:7px;height:7px;border-radius:50%;background:${s.color};margin-right:4px;`;
+    const val = document.createElement('span');
+    val.textContent = formatValue(s.points[s.points.length - 1].v);
+    el.appendChild(dot);
+    el.appendChild(val);
+  });
+}
+
+function renderTimeSeriesChart(svgId, tooltipId, series, opts) {
+  const svg = document.getElementById(svgId);
+  const tooltip = document.getElementById(tooltipId);
+  const wrap = svg.parentElement;
+  const svgNS = 'http://www.w3.org/2000/svg';
+  svg.textContent = '';
+  tooltip.style.display = 'none';
+
+  const allPoints = series.flatMap(s => s.points);
+  let empty = wrap.querySelector('.chart-empty');
+  if (allPoints.length < 2) {
+    if (!empty) {
+      empty = document.createElement('div');
+      empty.className = 'chart-empty';
+      empty.textContent = 'Collecting data…';
+      wrap.appendChild(empty);
+    }
+    empty.style.display = '';
+    svg.style.display = 'none';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  svg.style.display = '';
+
+  const width = svg.clientWidth || 300;
+  const height = svg.clientHeight || 90;
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+
+  const tMin = Math.min(...allPoints.map(p => p.t));
+  const tMax = Math.max(...allPoints.map(p => p.t));
+  const observedMax = Math.max(...allPoints.map(p => p.v));
+  let vMax = opts.yMax != null ? opts.yMax : Math.max(observedMax * 1.15, 1);
+  // Snap the scale itself to whole multiples of opts.roundYAxisTo (used by
+  // the tok/s chart, in whole tok/s) rather than just rounding the printed
+  // label -- otherwise the label would round to a "nice" number that no
+  // longer matches where the gridline actually sits.
+  if (opts.roundYAxisTo) vMax = Math.ceil(vMax / opts.roundYAxisTo) * opts.roundYAxisTo;
+  const plotW = width - CHART_PAD.left - CHART_PAD.right;
+  const plotH = height - CHART_PAD.top - CHART_PAD.bottom;
+
+  const x = t => CHART_PAD.left + plotW * (tMax === tMin ? 1 : (t - tMin) / (tMax - tMin));
+  const y = v => CHART_PAD.top + plotH * (1 - Math.min(1, Math.max(0, v / (vMax || 1))));
+
+  // Gridlines at 0/mid/max, each with its own value label -- recessive
+  // hairlines carrying the scale, not just decoration. Labels sit to the
+  // right of the left edge, nudged clear of the line itself.
+  // opts.formatAxisValue lets a chart show a coarser/rounder label here
+  // (e.g. tok/s snapped to the nearest 10, so the scale doesn't show noisy
+  // decimals) while opts.formatValue keeps full precision for the
+  // tooltip/legend/live-value readouts -- defaults to formatValue when unset.
+  const axisFormat = opts.formatAxisValue || opts.formatValue;
+  [0, 0.5, 1].forEach(frac => {
+    const gy = CHART_PAD.top + plotH * (1 - frac);
+    const line = document.createElementNS(svgNS, 'line');
+    line.setAttribute('x1', CHART_PAD.left); line.setAttribute('x2', width - CHART_PAD.right);
+    line.setAttribute('y1', gy); line.setAttribute('y2', gy);
+    line.setAttribute('stroke', 'var(--border)');
+    line.setAttribute('stroke-width', '1');
+    svg.appendChild(line);
+
+    const label = document.createElementNS(svgNS, 'text');
+    label.setAttribute('x', CHART_PAD.left + 3);
+    label.setAttribute('y', frac === 1 ? gy + 9 : (frac === 0 ? gy - 3 : gy - 2));
+    label.setAttribute('fill', 'var(--text-dim)');
+    label.setAttribute('font-size', '9');
+    label.textContent = axisFormat(vMax * frac);
+    svg.appendChild(label);
+  });
+
+  // Per-series average line (dashed, series color) -- s.avg is precomputed
+  // by the caller (renderHistoryCharts) as an average over only the samples
+  // where the model was actually generating tokens, not idle stretches, so
+  // it means something different from "average of everything on screen."
+  // Drawn under the data path/dots (added next) so it reads as a subtle
+  // reference rather than competing with the real line.
+  series.forEach(s => {
+    if (s.avg == null) return;
+    const gy = y(s.avg);
+    const avgLine = document.createElementNS(svgNS, 'line');
+    avgLine.setAttribute('x1', CHART_PAD.left); avgLine.setAttribute('x2', width - CHART_PAD.right);
+    avgLine.setAttribute('y1', gy); avgLine.setAttribute('y2', gy);
+    avgLine.setAttribute('stroke', s.color);
+    avgLine.setAttribute('stroke-width', '1.5');
+    avgLine.setAttribute('stroke-dasharray', '4,3');
+    avgLine.setAttribute('opacity', '0.6');
+    svg.appendChild(avgLine);
+
+    const avgLabel = document.createElementNS(svgNS, 'text');
+    avgLabel.setAttribute('x', width - CHART_PAD.right - 3);
+    avgLabel.setAttribute('y', gy - 3);
+    avgLabel.setAttribute('text-anchor', 'end');
+    avgLabel.setAttribute('fill', s.color);
+    avgLabel.setAttribute('font-size', '9');
+    avgLabel.textContent = `avg ${opts.formatValue(s.avg)}`;
+    svg.appendChild(avgLabel);
+  });
+
+  series.forEach(s => {
+    if (s.points.length < 2) return;
+    const d = s.points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${x(p.t).toFixed(1)} ${y(p.v).toFixed(1)}`).join(' ');
+    const path = document.createElementNS(svgNS, 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', s.color);
+    path.setAttribute('stroke-width', '2');
+    path.setAttribute('stroke-linejoin', 'round');
+    path.setAttribute('stroke-linecap', 'round');
+    svg.appendChild(path);
+    const last = s.points[s.points.length - 1];
+    const dot = document.createElementNS(svgNS, 'circle');
+    dot.setAttribute('cx', x(last.t)); dot.setAttribute('cy', y(last.v));
+    dot.setAttribute('r', '4');
+    dot.setAttribute('fill', s.color);
+    dot.setAttribute('stroke', 'var(--surface)');
+    dot.setAttribute('stroke-width', '2');
+    svg.appendChild(dot);
+  });
+
+  // Crosshair + hit layer -- an inline-SVG line chart is interactive by
+  // default, not an upgrade: hover snaps to the nearest sample on every
+  // series and shows all of them in one tooltip.
+  const crosshair = document.createElementNS(svgNS, 'line');
+  crosshair.setAttribute('y1', CHART_PAD.top);
+  crosshair.setAttribute('y2', height - CHART_PAD.bottom);
+  crosshair.setAttribute('stroke', 'var(--text-dim)');
+  crosshair.setAttribute('stroke-width', '1');
+  crosshair.setAttribute('stroke-dasharray', '2,2');
+  crosshair.style.display = 'none';
+  svg.appendChild(crosshair);
+
+  const hit = document.createElementNS(svgNS, 'rect');
+  hit.setAttribute('x', '0'); hit.setAttribute('y', '0');
+  hit.setAttribute('width', String(width)); hit.setAttribute('height', String(height));
+  hit.setAttribute('fill', 'transparent');
+  svg.appendChild(hit);
+
+  function nearestRows(targetT) {
+    return series.filter(s => s.points.length).map(s => {
+      let nearest = s.points[0], bestDiff = Infinity;
+      for (const p of s.points) {
+        const diff = Math.abs(p.t - targetT);
+        if (diff < bestDiff) { bestDiff = diff; nearest = p; }
+      }
+      return { name: s.name, color: s.color, v: nearest.v, t: nearest.t };
+    });
+  }
+
+  hit.addEventListener('pointermove', (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) * (width / rect.width);
+    const frac = Math.min(1, Math.max(0, (px - CHART_PAD.left) / plotW));
+    const targetT = tMin + frac * (tMax - tMin);
+    const rows = nearestRows(targetT);
+    if (!rows.length) return;
+    const snapT = rows[0].t;
+    crosshair.setAttribute('x1', x(snapT));
+    crosshair.setAttribute('x2', x(snapT));
+    crosshair.style.display = '';
+
+    tooltip.textContent = '';  // built via DOM nodes below, not innerHTML -- values/labels are untrusted data
+    const timeRow = document.createElement('div');
+    timeRow.className = 'tt-label';
+    timeRow.textContent = new Date(snapT * 1000).toLocaleTimeString();
+    tooltip.appendChild(timeRow);
+    rows.forEach(r => {
+      const row = document.createElement('div');
+      const key = document.createElement('span');
+      key.style.cssText = `display:inline-block;width:8px;height:2px;background:${r.color};margin-right:6px;`;
+      const val = document.createElement('span');
+      val.className = 'tt-value';
+      val.textContent = opts.formatValue(r.v);
+      const label = document.createElement('span');
+      label.className = 'tt-label';
+      label.textContent = ' ' + r.name;
+      row.appendChild(key); row.appendChild(val); row.appendChild(label);
+      tooltip.appendChild(row);
+    });
+    // Measure after content is set (so offsetWidth is accurate), then clamp
+    // horizontally so the tooltip never spills outside the chart wrap --
+    // no CSS transform, just a computed + clamped `left`. Must be 'block'.
+    // not '' -- clearing the inline style just falls back to the CSS
+    // class's own `display: none`, which never actually shows it.
+    tooltip.style.display = 'block';
+    tooltip.style.left = '0px';
+    const tw = tooltip.offsetWidth;
+    const desiredCenter = (x(snapT) / width) * rect.width;
+    const clampedLeft = Math.min(Math.max(desiredCenter - tw / 2, 4), Math.max(4, rect.width - tw - 4));
+    tooltip.style.left = `${clampedLeft}px`;
+  });
+  hit.addEventListener('pointerleave', () => {
+    crosshair.style.display = 'none';
+    tooltip.style.display = 'none';
+  });
+}
+
+function modelDisplayName(name, scenarioModels, standaloneModels) {
+  const found = scenarioModels.find(m => m.name === name) || standaloneModels.find(m => m.name === name);
+  return found ? found.label : name;
+}
+
+function renderHistoryCharts(data) {
+  const history = data.metrics_history || [];
+  const scenarioModels = data.scenario_models || [];
+  const standaloneModels = data.standalone_models || [];
+
+  // Scenario models only -- standalone models (nomic-embed-text in this
+  // stack) are embedding-only, never generate tokens, and their CPU/tok-s
+  // lines aren't meaningful here. Fixed order (configured scenario order)
+  // so a given model's color doesn't jump around as models load/unload.
+  const scenarioModelNames = [];
+  scenarioModels.forEach(m => {
+    if (!scenarioModelNames.includes(m.name)) scenarioModelNames.push(m.name);
+  });
+  // Token/s chart has no GPU-level series to share the palette with, so its
+  // models get the full color order starting at slot 0. Capped to
+  // SERIES_COLORS.length (3) -- past that, per the palette's all-pairs
+  // validation, fold to "Other" rather than pick an unvalidated 4th hue.
+  const modelSeriesMeta = scenarioModelNames.slice(0, SERIES_COLORS.length).map((name, i) => ({
+    key: name,
+    name: modelDisplayName(name, scenarioModels, standaloneModels),
+    color: SERIES_COLORS[i],
+  }));
+
+  const memSeries = [{
+    name: 'GPU memory',
+    color: SERIES_COLORS[0],
+    points: history.filter(s => s.gpu_mem_used != null).map(s => ({ t: s.t, v: s.gpu_mem_used })),
+  }];
+  const gpuTotalBytes = data.gpu ? parseByteStr(data.gpu.total) : 0;
+  renderTimeSeriesChart('memChart', 'memChartTooltip', memSeries, {
+    yMax: gpuTotalBytes > 0 ? gpuTotalBytes : null,
+    formatValue: formatBytes,
+  });
+  const lastMem = [...history].reverse().find(s => s.gpu_mem_used != null);
+  document.getElementById('memChartValue').textContent = lastMem ? formatBytes(lastMem.gpu_mem_used) : '—';
+
+  const powerSeries = [{
+    name: 'GPU power',
+    color: SERIES_COLORS[0],
+    points: history.filter(s => s.gpu_power_w != null).map(s => ({ t: s.t, v: s.gpu_power_w })),
+  }];
+  const powerLimit = data.gpu ? data.gpu.power_limit_w : null;
+  renderTimeSeriesChart('powerChart', 'powerChartTooltip', powerSeries, {
+    yMax: powerLimit || null,
+    formatValue: v => `${v.toFixed(0)} W`,
+  });
+  const lastPower = [...history].reverse().find(s => s.gpu_power_w != null);
+  document.getElementById('powerChartValue').textContent = lastPower ? `${lastPower.gpu_power_w.toFixed(0)} W` : '—';
+
+  // Combined GPU utilization (compute-engine busy %, from nvidia-smi) + per-
+  // model CPU % (host CPU time of the llama-server process itself) in one
+  // chart, since both are the same 0-100 percent scale -- they can read
+  // differently during generation (CPU-side dispatch loop can sit near
+  // 100% while the GPU's own engines read a bit under that), which is
+  // exactly why both are worth seeing together rather than guessing at
+  // the gap between two separate charts. GPU reserves color slot 0 (same
+  // blue used for it in the Memory/Power charts); models are offset by one
+  // slot so they never collide with the GPU line in this specific chart.
+  const utilSeries = [
+    {
+      name: 'GPU',
+      color: SERIES_COLORS[0],
+      points: history.filter(s => s.gpu_util_pct != null).map(s => ({ t: s.t, v: s.gpu_util_pct })),
+    },
+    ...scenarioModelNames.slice(0, SERIES_COLORS.length - 1).map((name, i) => ({
+      name: modelDisplayName(name, scenarioModels, standaloneModels),
+      color: SERIES_COLORS[i + 1],
+      points: history.filter(s => s.models?.[name]?.cpu_pct != null)
+                     .map(s => ({ t: s.t, v: s.models[name].cpu_pct })),
+    })),
+  ];
+  renderChartLegend('cpuChartLegend', utilSeries);
+  const utilFormat = v => `${v.toFixed(0)}%`;
+  renderChartValueSummary('cpuChartValue', utilSeries, utilFormat);
+  renderTimeSeriesChart('cpuChart', 'cpuChartTooltip', utilSeries, { yMax: 100, formatValue: utilFormat });
+
+  // avg is computed over samples with tok_s > 0 only -- _extract_tok_s
+  // (backend) reports an explicit 0.0, not a gap, whenever the model isn't
+  // actively generating, so a plain mean of `points` would be dragged down
+  // by however much idle time happens to be on screen. This is a genuine
+  // "average while working" figure, comparable across different idle/busy
+  // ratios.
+  const tokSeries = modelSeriesMeta.map(meta => {
+    const points = history.filter(s => s.models?.[meta.key]?.tok_s != null)
+                           .map(s => ({ t: s.t, v: s.models[meta.key].tok_s }));
+    const active = points.filter(p => p.v > 0);
+    return {
+      name: meta.name,
+      color: meta.color,
+      points,
+      avg: active.length ? active.reduce((sum, p) => sum + p.v, 0) / active.length : null,
+    };
+  });
+  renderChartLegend('tokChartLegend', tokSeries);
+  const tokFormat = v => `${v.toFixed(1)} tok/s`;
+  renderChartValueSummary('tokChartValue', tokSeries, tokFormat);
+  renderTimeSeriesChart('tokChart', 'tokChartTooltip', tokSeries, {
+    formatValue: tokFormat,
+    // Axis scale always in whole 10s -- "23.4 tok/s" as a gridline label is
+    // noise, not signal; the tooltip/legend above keep the precise .toFixed(1)
+    // reading, only the scale itself gets rounded.
+    formatAxisValue: v => `${Math.round(v / 10) * 10} tok/s`,
+    roundYAxisTo: 10,
+  });
+
+  // MTP accept % stacked directly below tok/s, same model->color mapping
+  // (one legend above covers both) and same time window, so the two read
+  // together without a second y-axis sharing the plot. Fixed 0-100 since
+  // it's a percent, like CPU% above. Updates in discrete jumps (once per
+  // completed generation, not continuously like tok/s) -- the backend
+  // already holds the last known reading between updates (see
+  // _extract_mtp), so this reads as a clean step line, not gaps.
+  // mtp_accept_pct has no idle-vs-active signal of its own -- the backend
+  // just holds the last known reading forever between completed generations
+  // (see metrics_sampler's comment above). Rendered as-is, that makes every
+  // idle stretch show a flat band at the last real value, which reads as
+  // ongoing activity and makes the average line hard to place against the
+  // data. Force it to 0 here whenever that same sample's tok_s is 0, so the
+  // line only shows a nonzero band while tokens are genuinely being
+  // generated -- same idle-vs-active visual language as the tok/s chart.
+  // The average calc (below) already ignored held-over idle values via its
+  // own tok_s > 0 filter, so this doesn't change what the average means,
+  // only what the line looks like.
+  const mtpSeries = modelSeriesMeta.map(meta => {
+    const points = history.filter(s => s.models?.[meta.key]?.mtp_accept_pct != null)
+                           .map(s => ({
+                             t: s.t,
+                             v: (s.models[meta.key].tok_s ?? 0) > 0 ? s.models[meta.key].mtp_accept_pct : 0,
+                           }));
+    const active = history
+      .filter(s => (s.models?.[meta.key]?.tok_s ?? 0) > 0 && s.models?.[meta.key]?.mtp_accept_pct != null)
+      .map(s => s.models[meta.key].mtp_accept_pct);
+    return {
+      name: meta.name,
+      color: meta.color,
+      points,
+      avg: active.length ? active.reduce((a, b) => a + b, 0) / active.length : null,
+    };
+  });
+  const mtpFormat = v => `${v.toFixed(0)}%`;
+  renderChartValueSummary('mtpChartValue', mtpSeries, mtpFormat);
+  renderTimeSeriesChart('mtpChart', 'mtpChartTooltip', mtpSeries, { yMax: 100, formatValue: mtpFormat });
 }
 
 // ---- Scenario models table (all models defined by the active scenario,
@@ -579,7 +1083,7 @@ function renderScenarioModelsTable(models) {
                       ![...currentModels].every(k => newModels.has(k));
 
   if (needRebuild) {
-    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Status</th><th>Processes</th><th>Idle</th><th>Evicts</th><th></th></tr></thead><tbody>`;
+    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Status</th><th>Processes</th><th>Tok/s</th><th>MTP %</th><th>Idle</th><th>Evicts</th><th></th></tr></thead><tbody>`;
     for (const m of models) {
       html += scenarioModelRowHtml(m);
     }
@@ -604,6 +1108,10 @@ function renderScenarioModelsTable(models) {
           idleCell.textContent = m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—';
         }
       }
+      const tokCell = row.querySelector('.tok-cell');
+      if (tokCell) tokCell.textContent = m.tok_s != null ? m.tok_s.toFixed(1) : '—';
+      const mtpCell = row.querySelector('.mtp-cell');
+      if (mtpCell) mtpCell.textContent = fmtMtp(m);
       const evictCell = row.querySelector('.evict-cell');
       if (evictCell) evictCell.textContent = fmtEvict(m);
     }
@@ -696,6 +1204,8 @@ function scenarioModelRowHtml(m) {
     <td>${m.port}</td>
     <td class="status-cell">${statusHtml}</td>
     <td class="proc-cell" data-port="${m.port}"><div class="proc-indicators">${indicators}<span class="proc-label">${procLabel}</span></div></td>
+    <td class="tok-cell">${m.tok_s != null ? m.tok_s.toFixed(1) : '—'}</td>
+    <td class="mtp-cell">${fmtMtp(m)}</td>
     <td class="idle-cell" data-idle-s="${m.idle_for_s != null ? m.idle_for_s : ''}">${m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—'}</td>
     <td class="evict-cell">${fmtEvict(m)}</td>
     <td class="action-cell"><button class="btn-sm" data-action="${action}" data-model="${m.name}">${actionLabel}</button></td>
@@ -751,7 +1261,7 @@ function renderModelsTable(models, containerId, cacheKey) {
                       ![...currentModels].every(k => newModels.has(k));
 
   if (needRebuild) {
-    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Processes</th><th>Idle</th><th>Evicts</th></tr></thead><tbody>`;
+    let html = `<table><thead><tr><th>Model</th><th>Port</th><th>Processes</th><th>Tok/s</th><th>MTP %</th><th>Idle</th><th>Evicts</th></tr></thead><tbody>`;
     for (const m of models) {
       const slotInfo = slotCache[m.port] || { slots: 0, running: 0, loaded: false };
       const numDots = slotInfo.slots || 1;
@@ -764,6 +1274,8 @@ function renderModelsTable(models, containerId, cacheKey) {
         <td class="model-name"><span class="model-name-trigger" tabindex="0">${m.label || m.name}</span>${modelTooltipHtml(m)}</td>
         <td>${m.port}</td>
         <td class="proc-cell" data-port="${m.port}"><div class="proc-indicators">${indicators}<span class="proc-label">${procLabel}</span></div></td>
+        <td class="tok-cell">${m.tok_s != null ? m.tok_s.toFixed(1) : '—'}</td>
+        <td class="mtp-cell">${fmtMtp(m)}</td>
         <td class="idle-cell" data-idle-s="${m.idle_for_s != null ? m.idle_for_s : ''}">${m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—'}</td>
         <td class="evict-cell">${fmtEvict(m)}</td>
       </tr>`;
@@ -782,6 +1294,10 @@ function renderModelsTable(models, containerId, cacheKey) {
             idleCell.textContent = m.idle_for_s != null ? fmtIdle(m.idle_for_s) : '—';
           }
         }
+        const tokCell = row.querySelector('.tok-cell');
+        if (tokCell) tokCell.textContent = m.tok_s != null ? m.tok_s.toFixed(1) : '—';
+        const mtpCell = row.querySelector('.mtp-cell');
+        if (mtpCell) mtpCell.textContent = fmtMtp(m);
         const evictCell = row.querySelector('.evict-cell');
         if (evictCell) evictCell.textContent = fmtEvict(m);
       }
