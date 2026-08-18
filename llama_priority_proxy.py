@@ -52,6 +52,8 @@ DEFAULT_LOAD_TIMEOUT_S = 300
 DEFAULT_MAX_WAIT_S = 60
 DEFAULT_KEEP_ALIVE_S = 300  # Ollama's own default idle timeout, used for blank/unset keep_alive
 IDLE_SWEEP_INTERVAL_S = 10
+SCENARIO_ACTIVATION_GRACE_S = 90  # see maybe_evict_idle_scenario -- time to let a freshly-activated,
+                                   # not-yet-eager-loaded scenario actually get its first real request
 DEFAULT_EVICT_DRAIN_TIMEOUT_S = 40  # see drain_in_flight_before_evict -- ~8k tokens at 200 tok/s
 USER_KEYS_REGISTER_COOLDOWN_S = 4  # global rate limit between /register POSTs, see handle_register_submit
 USER_KEYS_REVALIDATE_INTERVAL_S = 24 * 3600  # see user_keys_revalidation_sweep
@@ -313,6 +315,7 @@ class ProxyState:
         self.standalone = []
         self.label_index = {}
         self.active_scenario = None
+        self.active_scenario_since = None  # monotonic ts of the last activate_scenario() call -- see maybe_evict_idle_scenario's grace period
         self.pinned_scenario = None  # scenario name locked by an operator (see handle_pin_scenario) --
                                       # None means normal priority/idle/comfy_coexist rules apply as before
         self.loaded = {}          # model name -> LoadedModel (scenario-owned)
@@ -667,6 +670,7 @@ async def activate_scenario(state, scenario_name, load_timeout_s):
 
     state.reserved_ctx = new_sizes
     state.active_scenario = scenario_name
+    state.active_scenario_since = time.monotonic()
     await eager_load_pinned_members(state, scenario_name, load_timeout_s)
 
 
@@ -749,20 +753,38 @@ async def maybe_evict_idle_scenario(state):
         # incorrectly) reverted here well before ComfyUI actually finishes —
         # see the "5 minutes idle, comfy busy for 15" incident this guards.
         return
-    # No "if not state.loaded: return" guard here on purpose: every path that
-    # calls activate_scenario (and its internal eager-loading) does so while
-    # holding state.spawn_lock, and this function is only ever reached via
-    # idle_eviction_sweep, which needs that same lock first -- so there's no
-    # window where a scenario switch is "still starting up" when this runs.
-    # An empty state.loaded here means every member died individually (e.g.
-    # the ClientConnectorError crash-recovery path in handle_completion, which
-    # pops a dead model without touching active_scenario) while this scenario
-    # was still nominally active. Treating that as "not idle yet" left the
-    # proxy stuck showing an active-but-empty scenario forever, with no path
-    # back to default until some unrelated request happened to force a real
-    # switch. The loop below already does the right thing on an empty dict —
-    # it just never runs, and falls through to reverting to default.
     now = time.monotonic()
+    if state.active_scenario_since is not None and (now - state.active_scenario_since) < SCENARIO_ACTIVATION_GRACE_S:
+        # A scenario switch (dashboard "Switch"/"Pin" button, or a fallback
+        # switch on a real request) does NOT itself spawn a scenario's
+        # non-eager members -- most stay lazy, loaded on-demand only once a
+        # real request actually arrives (see eager_load_pinned_members).
+        # That leaves state.loaded genuinely, legitimately empty right after
+        # a fresh activation, for however long it takes the operator to
+        # send that first request. Without this grace period, the very next
+        # idle_eviction_sweep tick (up to IDLE_SWEEP_INTERVAL_S later) hit
+        # the "empty state.loaded" fallback below and reverted to default
+        # almost immediately -- before the operator got a chance to use the
+        # scenario they just switched to at all. This only delays that
+        # fallback, it doesn't disable it: past the grace period, an empty
+        # or all-idle scenario still reverts exactly as before.
+        return
+    # No further "if not state.loaded: return" guard here on purpose: every
+    # path that calls activate_scenario (and its internal eager-loading)
+    # does so while holding state.spawn_lock, and this function is only
+    # ever reached via idle_eviction_sweep, which needs that same lock
+    # first -- so there's no window where a scenario switch is "still
+    # starting up" when this runs (the grace period above already covers
+    # the "just finished starting up, nothing real has happened yet" case).
+    # An empty state.loaded past the grace period means every member died
+    # individually (e.g. the ClientConnectorError crash-recovery path in
+    # handle_completion, which pops a dead model without touching
+    # active_scenario) while this scenario was still nominally active.
+    # Treating that as "not idle yet" left the proxy stuck showing an
+    # active-but-empty scenario forever, with no path back to default until
+    # some unrelated request happened to force a real switch. The loop
+    # below already does the right thing on an empty dict — it just never
+    # runs, and falls through to reverting to default.
     for lm in state.loaded.values():
         timeout = parse_keep_alive(lm.keep_alive)
         if timeout is None or (now - lm.last_used) < timeout:

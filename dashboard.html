@@ -494,9 +494,26 @@ let pollTimer = null;
 let consecutiveFailures = 0;
 const DISCONNECTED_THRESHOLD = 2;
 
+// setInterval doesn't wait for a previous fetchAndRender() to finish before
+// firing the next one, and a manual action (pin/unpin/switch) also triggers
+// its own extra call on top of the timer -- so multiple /status requests can
+// genuinely be in flight at once, with no guarantee they RESOLVE in the
+// order they were SENT. Without this guard, an older call that happened to
+// resolve later (server hiccup, network jitter, or just bad luck) could
+// overwrite a newer, more accurate render with stale data -- e.g. a poll
+// that started just before a pin action completed landing its
+// still-not-yet-pinned response AFTER the pin's own fresh one, making the
+// button flicker back to "unpinned" even though the pin genuinely
+// succeeded. Each call captures its own sequence number; if a newer call
+// has since started by the time this one's response arrives, it's simply
+// discarded rather than rendered.
+let fetchSeq = 0;
+
 async function fetchAndRender() {
+  const seq = ++fetchSeq;
   try {
     const status = await apiFetch('/status');
+    if (seq !== fetchSeq) return;  // superseded by a newer call -- see fetchSeq
     consecutiveFailures = 0;
     showStatusOk('Connected');
     hideError();
@@ -506,13 +523,16 @@ async function fetchAndRender() {
     document.getElementById('emptyState').style.display = 'none';
     renderStatus(status);
   } catch(e) {
+    if (seq !== fetchSeq) return;  // superseded by a newer call -- see fetchSeq
     consecutiveFailures++;
     if (consecutiveFailures >= DISCONNECTED_THRESHOLD) {
       showStatusErr('Disconnected');
       showError(e.message);
     }
   }
-  document.getElementById('refreshInfo').textContent = `Refresh: ${getRefreshRateSeconds()}s`;
+  if (seq === fetchSeq) {
+    document.getElementById('refreshInfo').textContent = `Refresh: ${getRefreshRateSeconds()}s`;
+  }
 }
 
 function startPolling() {
