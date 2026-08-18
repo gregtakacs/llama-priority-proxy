@@ -62,7 +62,10 @@ TOK_S_GRACE_S = 6  # hold the last real tg_3s reading this long between llama.cp
 
 _KEEP_ALIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)(s|m|h)$")
 _KEEP_ALIVE_UNITS = {"s": 1, "m": 60, "h": 3600}
-_TOK_S_RE = re.compile(r"tg_3s\s*=\s*([\d.]+) t/s")
+_TOK_S_RE = re.compile(r"slot print_timing: id\s+(\d+) \|.*?tg_3s\s*=\s*([\d.]+) t/s")
+_MTP_RE = re.compile(
+    r"slot print_timing: id\s+(\d+) \| task \d+ \| draft acceptance = [\d.]+ \(\s*(\d+) accepted /\s*(\d+) generated\)"
+)
 
 
 def parse_keep_alive(raw):
@@ -334,9 +337,9 @@ class ProxyState:
         self.metrics_history = deque(maxlen=METRICS_HISTORY_LEN)  # see metrics_sampler
         self.metrics_sweep_task = None        # background metrics_sampler task
         self._log_offsets = {}   # model name -> last-scanned byte offset in its llama-server log (tok/s sampling)
-        self._tok_s_last = {}    # model name -> (last real tg_3s value, monotonic ts), for TOK_S_GRACE_S hold
+        self._tok_s_last = {}    # model name -> {slot id: (last real tg_3s value, monotonic ts)}, for TOK_S_GRACE_S hold per slot -- see _extract_tok_s
         self._cpu_ticks = {}     # model name -> (prev utime+stime jiffies, monotonic ts), for CPU% deltas
-        self._live_mtp = {}      # model name -> {"accepted","generated"}, updated live by forward() as requests stream
+        self._mtp_last = {}      # model name -> {slot id: (accepted, generated)} from that slot's most recently COMPLETED task -- see _extract_mtp
 
 
 # ---------------------------------------------------------------------------
@@ -826,10 +829,10 @@ def _sample_cpu_pct(state, name, pid, now):
 
 def _read_new_log_text(state, name, log_path):
     """Text appended to this model's per-request timing log since the last
-    call for it, for the tok/s extractor below (MTP acceptance is sourced
-    live from the actual request/response path instead -- see
-    _record_live_mtp/state._live_mtp). Returns None if the log can't be
-    read right now (model not actually up yet)."""
+    call for it, for the tok/s and MTP-acceptance extractors below (both
+    parse the same per-slot "slot print_timing: ..." lines from it).
+    Returns None if the log can't be read right now (model not actually up
+    yet)."""
     try:
         size = os.path.getsize(log_path)
     except OSError:
@@ -853,50 +856,107 @@ def _read_new_log_text(state, name, log_path):
 
 
 def _extract_tok_s(state, name, now, new_text):
-    """Most recent tg_3s (trailing-3s decode rate) among newly-appended log
-    text. Holds the last real reading for TOK_S_GRACE_S so the chart doesn't
-    dip to 0 between llama.cpp's own ~3s print_timing cadence; returns 0.0
-    (not None) once that grace period lapses with nothing new -- "not
-    generating" is a real zero-valued sample, same as cpu_pct's idle
-    reading, not a gap, so the history chart's x-axis stays aligned with
-    the other metrics instead of the tok/s line stopping short while
-    mem/power/cpu keep advancing."""
-    matches = _TOK_S_RE.findall(new_text)
-    if matches:
-        val = float(matches[-1])
-        state._tok_s_last[name] = (val, now)
-        return val
-    last = state._tok_s_last.get(name)
-    if last is not None and (now - last[1]) < TOK_S_GRACE_S:
-        return last[0]
-    return 0.0
+    """Sum of every slot's most recent tg_3s (trailing-3s decode rate) among
+    newly-appended log text. llama-server prints one tg_3s line PER SLOT
+    independently (see the "slot print_timing: id N | ..." format), not one
+    combined figure for the model as a whole -- with --parallel > 1 and more
+    than one slot actually generating at once, taking just the newest line
+    (the old behavior, before slot ids were parsed out at all) silently
+    dropped every other concurrently-active slot's throughput, undercounting
+    real aggregate tok/s whenever more than one request was in flight.
+    Each slot's own last reading is tracked separately in
+    state._tok_s_last[name] (keyed by slot id) and held for TOK_S_GRACE_S so
+    the chart doesn't dip between llama.cpp's own ~3s print_timing cadence;
+    a slot whose reading has aged out of that window contributes 0 to the
+    sum rather than lingering forever. Returns 0.0 (not None) once every
+    slot's reading has aged out -- "not generating" is a real zero-valued
+    sample, same as cpu_pct's idle reading, not a gap, so the history
+    chart's x-axis stays aligned with the other metrics instead of the
+    tok/s line stopping short while mem/power/cpu keep advancing."""
+    slots = state._tok_s_last.setdefault(name, {})
+    for slot_id, val in _TOK_S_RE.findall(new_text):
+        slots[slot_id] = (float(val), now)
+    return round(sum(val for val, ts in slots.values() if (now - ts) < TOK_S_GRACE_S), 2)
+
+
+def _extract_mtp(state, name, new_text):
+    """Combined (accepted, generated) draft-token totals across every slot's
+    most recently COMPLETED task, sourced from llama-server's own per-task
+    log line ("draft acceptance = ... (A accepted / G generated)") -- same
+    log, same per-slot-id parsing pattern as _extract_tok_s, and for the
+    same reason: draft stats used to be tracked live via the streaming
+    response body instead (the now-removed _record_live_mtp/state._live_mtp),
+    keyed only by MODEL NAME with no slot or task attribution at all. With
+    --parallel > 1 and more than one slot actually generating at once, that
+    meant one request's "reset" (its first draft-bearing chunk) could
+    silently wipe out a DIFFERENT, still in-flight request's already-
+    accumulated total, and their chunks would then merge into one
+    incoherent running count -- worse than tok/s's old bug (which only
+    dropped data), since this one actively corrupted it.
+    Each slot's own last-completed-task totals are held in
+    state._mtp_last[name] (keyed by slot id) and, unlike tok_s, held
+    indefinitely rather than decaying after a grace period -- MTP% is
+    documented (see dashboard.html) as reading "the last completed
+    generation", not a live rate, so a slot that finished 10 minutes ago
+    should still show its real last result rather than dropping out.
+    Returns (0, 0) if no slot has completed a draft-bearing task yet."""
+    slots = state._mtp_last.setdefault(name, {})
+    for slot_id, accepted, generated in _MTP_RE.findall(new_text):
+        slots[slot_id] = (int(accepted), int(generated))
+    return sum(a for a, g in slots.values()), sum(g for a, g in slots.values())
+
+
+async def _fetch_ctx_used(state, port):
+    """n_prompt_tokens per slot at this model's port, ordered by slot id --
+    each element is one slot's share of the (--kv-unified, shared across
+    --parallel slots) context pool, so the dashboard can chart a --parallel-4
+    model as 4 separately-stacked bands instead of one pre-summed line.
+    Each slot's n_prompt_tokens covers that slot's whole running
+    conversation (grows turn over turn), not just the latest request, and --
+    unlike tok_s -- llama-server does NOT reset it to 0 between requests: it
+    holds the last completed turn's length until that slot serves a
+    genuinely different conversation. That's the desired reading here (a
+    paused-but-still-resident chat keeps showing its real accumulated size,
+    not a misleading drop to 0 between messages); a model actually freeing
+    its context shows up instead as that model's key disappearing from
+    `models` entirely once evicted. None if the child isn't reachable (not
+    fully up yet, or mid-respawn)."""
+    try:
+        async with state.http_session.get(f"http://127.0.0.1:{port}/slots",
+                                           timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            slots = await resp.json()
+            return [s.get("n_prompt_tokens") or 0 for s in sorted(slots, key=lambda s: s.get("id", 0))]
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+        return None
 
 
 async def metrics_sampler(state):
     """Background task: samples GPU mem/util/power plus per-model CPU%/
-    tok-s every METRICS_SAMPLE_INTERVAL_S and appends to
-    state.metrics_history. MTP acceptance is NOT sampled here -- it's
-    updated live, per-chunk, by forward() itself as real requests stream
-    through (see state._live_mtp); this loop just reads whatever forward()
-    last wrote, same as it reads whatever _extract_tok_s last computed."""
+    tok-s/ctx-used/MTP-acceptance every METRICS_SAMPLE_INTERVAL_S and
+    appends to state.metrics_history."""
     loop = asyncio.get_event_loop()
     while True:
         await asyncio.sleep(METRICS_SAMPLE_INTERVAL_S)
         now = time.monotonic()
         gpu_used = await loop.run_in_executor(None, gpu_used_bytes, state.gpu_index)
         gpu_extra = await loop.run_in_executor(None, gpu_stats, state.gpu_index)
+        loaded_models = list(state.loaded.values()) + list(state.standalone_loaded.values())
+        # One /slots round-trip per loaded model, all concurrent -- serial
+        # would add up to N * (up to 5s timeout) to every sample tick.
+        ctx_used_list = await asyncio.gather(*(_fetch_ctx_used(state, lm.port) for lm in loaded_models))
         models = {}
-        for lm in list(state.loaded.values()) + list(state.standalone_loaded.values()):
+        for lm, ctx_used in zip(loaded_models, ctx_used_list):
             pid = lm.handle.proc.pid if lm.handle.kind == "native" and lm.handle.proc else None
             new_text = _read_new_log_text(state, lm.name, lm.handle.log_path) if lm.handle.log_path else None
-            mtp = state._live_mtp.get(lm.name)
-            mtp_generated = mtp["generated"] if mtp else 0
+            mtp_accepted, mtp_generated = _extract_mtp(state, lm.name, new_text) if new_text is not None else (0, 0)
+            has_mtp_data = mtp_generated > 0
             models[lm.name] = {
                 "cpu_pct": _sample_cpu_pct(state, lm.name, pid, now) if pid else None,
                 "tok_s": _extract_tok_s(state, lm.name, now, new_text) if new_text is not None else None,
-                "mtp_accept_pct": round(mtp["accepted"] / mtp_generated * 100, 1) if mtp_generated else None,
-                "mtp_accepted": mtp["accepted"] if mtp else None,
-                "mtp_generated": mtp_generated if mtp else None,
+                "ctx_used": ctx_used,
+                "mtp_accept_pct": round(mtp_accepted / mtp_generated * 100, 1) if has_mtp_data else None,
+                "mtp_accepted": mtp_accepted if has_mtp_data else None,
+                "mtp_generated": mtp_generated if has_mtp_data else None,
             }
         state.metrics_history.append({
             "t": time.time(),
@@ -949,36 +1009,6 @@ async def wait_for_capacity(request, state, port, heartbeat_response, max_wait_s
 # the client actually asked for, so aliasing (phase 3) is invisible to it.
 # ---------------------------------------------------------------------------
 
-def _record_live_mtp(state, name, timings, reset):
-    """Feeds a request's MTP draft stats into state._live_mtp as real
-    traffic flows through forward() -- this is the ACTUAL request/response
-    path, not a side-channel log scrape, so it's as fresh as the traffic
-    itself (per-chunk on a streaming response, essentially every decode
-    step) rather than only once at task completion. `reset=True` starts a
-    fresh running total (the first chunk of a new streaming response, or
-    a non-streaming response which arrives as one already-final total);
-    `reset=False` accumulates onto the request already in flight. Absent
-    or draft-less timings (embedding models, non-MTP models) leave
-    state._live_mtp untouched, matching the "None means never seen one"
-    semantics used elsewhere (e.g. nomic-embed shows '--'). Returns True
-    if it actually recorded something -- the caller needs this to know
-    when `reset` should next fire, since a streaming response's first one
-    or two chunks (role announcement, first prompt-only timing) typically
-    carry no draft_n at all; treating THOSE as "the reset chunk" would
-    leave the real first draft-bearing chunk of a NEW request wrongly
-    accumulating onto the previous request's already-finished total."""
-    if not timings or "draft_n" not in timings:
-        return False
-    prev = None if reset else state._live_mtp.get(name)
-    base_accepted = prev["accepted"] if prev else 0
-    base_generated = prev["generated"] if prev else 0
-    state._live_mtp[name] = {
-        "accepted": base_accepted + timings.get("draft_n_accepted", 0),
-        "generated": base_generated + timings.get("draft_n", 0),
-    }
-    return True
-
-
 async def forward(request, state, body, port, client_label, real_name, max_wait_s):
     body["model"] = real_name
     is_stream = bool(body.get("stream"))
@@ -1029,12 +1059,10 @@ async def forward(request, state, body, port, client_label, real_name, max_wait_
         if not is_stream:
             data = await resp.json()
             if isinstance(data, dict):
-                _record_live_mtp(state, real_name, data.get("timings"), reset=True)
                 if "model" in data:
                     data["model"] = client_label
             return web.json_response(data, status=resp.status)
 
-        is_first_draft_chunk = True  # flips False only once a chunk actually carries draft_n -- see _record_live_mtp
         async for line_bytes in resp.content:
             line = line_bytes.decode("utf-8", errors="replace")
             if line.startswith("data: "):
@@ -1045,8 +1073,6 @@ async def forward(request, state, body, port, client_label, real_name, max_wait_
                     except json.JSONDecodeError:
                         obj = None
                     if obj is not None:
-                        if _record_live_mtp(state, real_name, obj.get("timings"), reset=is_first_draft_chunk):
-                            is_first_draft_chunk = False
                         if real_name != client_label and "model" in obj:
                             obj["model"] = client_label
                             line = f"data: {json.dumps(obj)}\n"
@@ -1630,17 +1656,27 @@ async def handle_comfyui_proxy(request):
     return response
 
 
+_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
+
+
 async def handle_dashboard(request):
-    """Serve the dashboard HTML (see dashboard.html) — no auth required."""
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    """Serve the dashboard HTML (see dashboard.html) — no auth required.
+    no-store: this HTML embeds its own JS inline and is redeployed by
+    rebuilding the image, not by a versioned asset URL -- without this, a
+    browser tab left open (or just a plain reload, not a hard-refresh)
+    across a redeploy keeps running old JS against the now-updated /status
+    response shape, which has already produced real bugs (old scalar-based
+    JS reading a newly-array-shaped field coerces it to NaN)."""
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html", headers=_NO_STORE_HEADERS)
 
 
 async def handle_admin(request):
     """Serve the registered-users admin HTML (see admin.html) — no auth required for
     the static shell itself, same posture as /dashboard: the page can't see anything
     until its own JS supplies the admin Bearer key to /register/users*, which IS
-    protected by auth_middleware like everything else admin-only."""
-    return web.Response(text=ADMIN_HTML, content_type="text/html")
+    protected by auth_middleware like everything else admin-only. no-store for the
+    same reason as /dashboard above."""
+    return web.Response(text=ADMIN_HTML, content_type="text/html", headers=_NO_STORE_HEADERS)
 
 
 # ---------------------------------------------------------------------------

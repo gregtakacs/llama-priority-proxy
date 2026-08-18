@@ -84,21 +84,27 @@
     {
       "name": "Qwen3.8-27B-UD-Q4_K_XL",
       "parallel_tested": 4,
-      "max_ctx": 262144,
-      "base_vram_bytes": 19753507434,
-      "bytes_per_ctx_token": 23446.349206349205,
+      "max_ctx": 200704,
+      "base_vram_bytes": 21257038507,
+      "bytes_per_ctx_token": 36277.333333333336,
       "config_signature": {
         "parallel": 4,
-        "max_ctx": 262144,
+        "max_ctx": 200704,
         "min_ctx": null,
         "n_gpu_layers": 99,
         "extra_args": [
-          "--mmproj",
-          "/models/Qwen3.8-27B-UD-Q4_K_XL.mmproj-BF16.gguf",
           "-ctk",
-          "q4_0",
+          "q8_0",
           "-ctv",
-          "q4_0"
+          "q4_0",
+          "--spec-type",
+          "draft-mtp",
+          "--spec-draft-n-max",
+          "4",
+          "--reasoning",
+          "on",
+          "--reasoning-effort",
+          "medium"
         ]
       },
       "warmup_prompt_tokens": 3072,
@@ -106,16 +112,16 @@
       "samples": [
         {
           "ctx": 4096,
-          "vram_bytes": 19849543680,
+          "vram_bytes": 21405630464,
           "near_ceiling": false
         },
         {
-          "ctx": 262144,
-          "vram_bytes": 25899827200,
+          "ctx": 200704,
+          "vram_bytes": 28538044416,
           "near_ceiling": false
         }
       ],
-      "measured_at": "2026-08-15T15:18:40"
+      "measured_at": "2026-08-17T19:37:21"
     },
     {
       "name": "nomic-embed-text",
