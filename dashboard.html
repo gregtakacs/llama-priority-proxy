@@ -209,6 +209,11 @@
   .refresh-info { font-size: 0.75rem; color: var(--text-dim); }
   .hidden { display: none; }
   .error-msg { color: var(--red); font-size: 0.82rem; margin-top: 8px; }
+  .gpu-offline-banner {
+    background: rgba(248,113,113,0.12); border: 1px solid var(--red); color: var(--red);
+    font-size: 0.82rem; font-weight: 600; padding: 8px 10px; border-radius: 6px;
+    margin-bottom: 10px; line-height: 1.4;
+  }
   .scenario-item[data-scenario] { cursor: pointer; }
   .scenario-item[data-scenario]:hover { border-color: var(--accent); }
   .modal-overlay {
@@ -281,6 +286,7 @@
 
     <div class="card">
       <div class="card-title">GPU VRAM</div>
+      <div class="gpu-offline-banner hidden" id="gpuOfflineBanner"></div>
       <div class="gpu-text"><strong id="gpuUsed">—</strong> used of <strong id="gpuTotal">—</strong></div>
       <div class="gpu-bar-wrap"><div class="gpu-bar" id="gpuBar"></div></div>
       <div class="gpu-text" id="gpuFree" style="margin-top:4px;"></div>
@@ -663,6 +669,15 @@ function renderStatus(data) {
   document.getElementById('lastUpdate').textContent = `Last update: ${new Date().toLocaleTimeString()}`;
 
   if (data.gpu) {
+    const offlineBanner = document.getElementById('gpuOfflineBanner');
+    if (data.gpu.ok === false) {
+      const since = data.gpu.error_since_s != null ? ` (for ${fmtIdle(data.gpu.error_since_s)})` : '';
+      offlineBanner.textContent = `🔴 GPU offline${since}: ${data.gpu.error || 'unknown error'} — likely needs a host reboot.`;
+      offlineBanner.classList.remove('hidden');
+    } else {
+      offlineBanner.classList.add('hidden');
+    }
+
     document.getElementById('gpuTotal').textContent = data.gpu.total;
     document.getElementById('gpuUsed').textContent = data.gpu.used;
     if (data.gpu.free) document.getElementById('gpuFree').textContent = `Free: ${data.gpu.free}`;

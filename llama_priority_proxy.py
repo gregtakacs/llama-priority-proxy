@@ -43,7 +43,7 @@ import aiohttp
 from aiohttp import web
 
 from llama_process import (
-    format_bytes, gpu_stats, gpu_total_bytes, gpu_used_bytes,
+    format_bytes, gpu_health, gpu_stats, gpu_total_bytes, gpu_used_bytes,
     launch_server, max_ctx_for_budget, predicted_vram, shutdown_server, wait_for_health,
 )
 
@@ -343,6 +343,14 @@ class ProxyState:
         self._tok_s_last = {}    # model name -> {slot id: (last real tg_3s value, monotonic ts)}, for TOK_S_GRACE_S hold per slot -- see _extract_tok_s
         self._cpu_ticks = {}     # model name -> (prev utime+stime jiffies, monotonic ts), for CPU% deltas
         self._mtp_last = {}      # model name -> {slot id: (accepted, generated)} from that slot's most recently COMPLETED task -- see _extract_mtp
+        # GPU presence, polled by metrics_sampler (see gpu_health) -- distinct from
+        # the VRAM figures above, which assume the card is there. Checked in-memory
+        # by handle_completion's early gate rather than calling nvidia-smi per
+        # request, and by handle_status so a dropout (e.g. Xid 79, "fallen off the
+        # bus") shows up as a clean status field instead of an unhandled 500.
+        self.gpu_ok = True
+        self.gpu_error = None        # nvidia-smi's own error text when gpu_ok is False
+        self.gpu_error_since = None  # monotonic ts gpu_ok last flipped to False
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +655,18 @@ async def activate_scenario(state, scenario_name, load_timeout_s):
         # (e.g. a vision request forcing a real switch) — free ComfyUI too,
         # since the coexistence model is being evicted anyway.
         await free_comfyui_memory(state)
+
+    if not state.gpu_ok:
+        # Can't size/eager-load anything against an unknown VRAM budget (see
+        # gpu_health) -- deliberately leave state.active_scenario untouched
+        # (None at boot) rather than faking a switch: that keeps this the
+        # same "nothing's active" state handle_status already renders safely,
+        # and means the real activation naturally retries itself the next
+        # time a request reaches here once gpu_ok flips back to True, instead
+        # of needing its own recovery path. handle_completion's own gpu_ok
+        # gate already covers on-demand requests for the whole outage.
+        print(f"[proxy] activate_scenario('{scenario_name}'): GPU offline ({state.gpu_error}) -- deferring")
+        return
 
     scenario = state.scenarios[scenario_name]
     gpu_total = gpu_total_bytes(state.gpu_index)
@@ -960,8 +980,17 @@ async def metrics_sampler(state):
     while True:
         await asyncio.sleep(METRICS_SAMPLE_INTERVAL_S)
         now = time.monotonic()
-        gpu_used = await loop.run_in_executor(None, gpu_used_bytes, state.gpu_index)
-        gpu_extra = await loop.run_in_executor(None, gpu_stats, state.gpu_index)
+        gpu_ok, gpu_error = await loop.run_in_executor(None, gpu_health, state.gpu_index)
+        if gpu_ok != state.gpu_ok:
+            print(f"[proxy] GPU {'back online' if gpu_ok else 'offline: ' + gpu_error}")
+        state.gpu_ok = gpu_ok
+        state.gpu_error = gpu_error
+        state.gpu_error_since = None if gpu_ok else (state.gpu_error_since or now)
+        # Don't bother calling nvidia-smi again for figures it just told us it
+        # can't report -- gpu_used/gpu_extra stay at their "unknown" shape below.
+        gpu_used = await loop.run_in_executor(None, gpu_used_bytes, state.gpu_index) if gpu_ok else None
+        gpu_extra = (await loop.run_in_executor(None, gpu_stats, state.gpu_index) if gpu_ok
+                     else {"utilization_pct": None, "power_draw_w": None, "power_limit_w": None})
         loaded_models = list(state.loaded.values()) + list(state.standalone_loaded.values())
         # One /slots round-trip per loaded model, all concurrent -- serial
         # would add up to N * (up to 5s timeout) to every sample tick.
@@ -1124,6 +1153,62 @@ def request_has_image(body):
     return False
 
 
+def gpu_offline_message(state):
+    return (f"⚠️ The GPU on this host is offline ({state.gpu_error}) — no model can run right now. "
+            f"This is an automatic placeholder reply, not a real model response; nothing was actually "
+            f"processed. This usually means the card fell off the PCIe bus and needs a host reboot to "
+            f"recover — nudge the operator.")
+
+
+async def gpu_offline_response(request, requested_label, body, state):
+    """Synthesized OpenAI-shaped completion used in place of the real backend
+    when state.gpu_ok is False (see handle_completion's early gate). A plain
+    503 here reads as "server hiccup, maybe retry" to most chat clients, which
+    is misleading when the actual problem is a PCIe bus dropout that needs a
+    host reboot — shaping this as a normal completion instead means the
+    explanation lands as a visible chat message in Open WebUI etc., not a
+    toast/log line nobody's watching. Mirrors forward()'s streaming-vs-not and
+    legacy-vs-chat branching so it's indistinguishable in shape from a real
+    completion to whatever client asked."""
+    message = gpu_offline_message(state)
+    created = int(time.time())
+    is_legacy = request.path == "/v1/completions"
+
+    if not bool(body.get("stream")):
+        if is_legacy:
+            payload = {
+                "id": "cmpl-gpu-offline", "object": "text_completion", "created": created,
+                "model": requested_label,
+                "choices": [{"index": 0, "text": message, "finish_reason": "stop", "logprobs": None}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        else:
+            payload = {
+                "id": "chatcmpl-gpu-offline", "object": "chat.completion", "created": created,
+                "model": requested_label,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": message},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        return web.json_response(payload)
+
+    response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+    await response.prepare(request)
+    if is_legacy:
+        chunk = {"id": "cmpl-gpu-offline", "object": "text_completion", "created": created,
+                 "model": requested_label,
+                 "choices": [{"index": 0, "text": message, "finish_reason": "stop", "logprobs": None}]}
+    else:
+        chunk = {"id": "chatcmpl-gpu-offline", "object": "chat.completion.chunk", "created": created,
+                 "model": requested_label,
+                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": message},
+                              "finish_reason": "stop"}]}
+    await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+    await response.write(b"data: [DONE]\n\n")
+    await response.write_eof()
+    return response
+
+
 async def handle_completion(request):
     state = request.app["state"]
     try:
@@ -1135,6 +1220,15 @@ async def handle_completion(request):
     target = state.label_index.get(requested_label)
     if target is None:
         return openai_error(404, f"Unknown model '{requested_label}'.", code="model_not_found")
+
+    if not state.gpu_ok:
+        # Embeddings aren't chat-shaped -- a fake vector would silently
+        # corrupt whatever store it lands in, unlike a fake chat message a
+        # person actually reads. Fail those loudly instead.
+        if request.path == "/v1/embeddings":
+            return openai_error(503, f"GPU is offline on this host ({state.gpu_error}) — "
+                                      f"no model can run.", code="gpu_offline")
+        return await gpu_offline_response(request, requested_label, body, state)
 
     has_image = request_has_image(body)
     if has_image and not model_supports_vision(state, target["name"]):
@@ -1349,9 +1443,19 @@ async def handle_completion(request):
 async def handle_status(request):
     state = request.app["state"]
     now = time.monotonic()
-    gpu_total = gpu_total_bytes(state.gpu_index)
-    gpu_used = gpu_used_bytes(state.gpu_index)
-    gpu_extra = gpu_stats(state.gpu_index)
+    # state.gpu_ok is metrics_sampler's last poll (up to METRICS_SAMPLE_INTERVAL_S
+    # stale) -- still try live if it thought things were fine, but don't let a
+    # dropout that happened in between raise past a try/except into a 500;
+    # fall back to the "unknown" shape below just like the offline branch.
+    gpu_total = gpu_used = None
+    gpu_extra = {"utilization_pct": None, "power_draw_w": None, "power_limit_w": None}
+    if state.gpu_ok:
+        try:
+            gpu_total = gpu_total_bytes(state.gpu_index)
+            gpu_used = gpu_used_bytes(state.gpu_index)
+            gpu_extra = gpu_stats(state.gpu_index)
+        except RuntimeError:
+            pass
     # Idle-eviction only ever reverts a non-default scenario (see
     # maybe_evict_idle_scenario) — while the default scenario is active,
     # nothing gets evicted on idle no matter how long it's been sitting there.
@@ -1439,6 +1543,9 @@ async def handle_status(request):
             "utilization_pct": gpu_extra["utilization_pct"],
             "power_draw_w": gpu_extra["power_draw_w"],
             "power_limit_w": gpu_extra["power_limit_w"],
+            "ok": state.gpu_ok,
+            "error": state.gpu_error,
+            "error_since_s": None if state.gpu_error_since is None else round(now - state.gpu_error_since, 1),
         },
         "scenarios": [
             {"name": s["name"], "priority": s["priority"], "default": s.get("default", False),
@@ -1888,6 +1995,14 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "register.htm
 async def on_startup(app):
     state = app["state"]
     state.http_session = aiohttp.ClientSession()
+
+    # Prime gpu_ok/gpu_error before metrics_sampler's first tick (up to
+    # METRICS_SAMPLE_INTERVAL_S away) so a dropout that predates this restart
+    # is already known before the default-scenario activate below.
+    state.gpu_ok, state.gpu_error = gpu_health(state.gpu_index)
+    if not state.gpu_ok:
+        state.gpu_error_since = time.monotonic()
+        print(f"[proxy] GPU offline at startup: {state.gpu_error}")
 
     # Unconditional, best-effort ComfyUI VRAM free before any of our own scenario
     # activation/eager-loading below -- state.active_scenario/pinned_scenario always

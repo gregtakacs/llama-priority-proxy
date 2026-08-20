@@ -68,6 +68,27 @@ def gpu_used_bytes(gpu_index=0):
     return int(float(result.stdout.strip().splitlines()[0])) * 1024 * 1024
 
 
+def gpu_health(gpu_index=0):
+    """Cheap presence check, distinct from gpu_total_bytes/gpu_used_bytes above
+    (which assume the card is there and just want a VRAM figure) -- returns
+    (True, None) if nvidia-smi can see it, or (False, message) with nvidia-smi's
+    own error text otherwise. That text is what actually distinguishes a genuine
+    bus dropout (stderr/stdout: "No devices were found", following an Xid 79 in
+    dmesg -- needs a host reboot to recover) from a transient hiccup, so callers
+    that surface it to a person get the real reason instead of a bare False."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader", f"--id={gpu_index}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    if result.returncode != 0 or not result.stdout.strip():
+        message = result.stderr.strip() or result.stdout.strip() or f"nvidia-smi exited {result.returncode}"
+        return False, message
+    return True, None
+
+
 def gpu_stats(gpu_index=0):
     """Utilization + power draw/limit for the dashboard's GPU card -- kept as its own
     single nvidia-smi call rather than folded into gpu_total_bytes/gpu_used_bytes above,
